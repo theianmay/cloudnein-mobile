@@ -274,7 +274,7 @@ export const ChatScreen: FC = function ChatScreen() {
     <Screen preset="fixed" contentContainerStyle={themed($screen)} safeAreaEdges={["top"]}>
       {/* Header */}
       <View style={themed($header)}>
-        <Text preset="heading" style={themed($headerTitle)} text="Sovereign Ledger" />
+        <Text preset="heading" style={themed($headerTitle)} text="cloudNein" />
         <Text
           style={themed($headerSubtitle)}
           text={`FunctionGemma (local) + Gemini Flash (cloud)${geminiReady ? "" : " \u00B7 Gemini not configured"}${dbReady ? "" : " \u00B7 DB loading..."}`}
@@ -291,10 +291,10 @@ export const ChatScreen: FC = function ChatScreen() {
         style={themed($messageListContainer)}
         ListEmptyComponent={
           <View style={themed($emptyState)}>
-            <Text style={themed($emptyTitle)} text="Sovereign Ledger" />
+            <Text style={themed($emptyTitle)} text="cloudNein" />
             <Text
               style={themed($emptySubtitle)}
-              text="Your private financial assistant. Sensitive data never leaves your device raw."
+              text="Your private financial assistant. Sensitive data never leaves your device."
             />
             <View style={themed($emptyHints)}>
               <Text style={themed($emptyHint)} text={'Try: "Show me pending wire approvals"'} />
