@@ -18,12 +18,48 @@ export interface ToolExecutionResult {
   redactedPreview?: string
 }
 
+/**
+ * Fuzzy-match tool names to handle FunctionGemma 270M typos
+ * (e.g. "get_wire_approval" → "get_wire_approvals")
+ */
+const TOOL_ALIASES: Record<string, string> = {
+  get_wire_approval: "get_wire_approvals",
+  wire_approvals: "get_wire_approvals",
+  budget_status: "get_budget_status",
+  expenses: "query_expenses",
+  revenue: "query_revenue",
+  detect_pii_entities: "detect_pii",
+  redact: "redact_and_analyze",
+  cloud: "cloud_analyze",
+}
+
+function resolveToolName(name: string): string {
+  return TOOL_ALIASES[name] ?? name
+}
+
+/**
+ * Fix common argument mistakes from FunctionGemma 270M.
+ * e.g. passing "Enterprise" as client instead of segment for query_revenue.
+ */
+function fixArguments(name: string, args: Record<string, unknown>): Record<string, unknown> {
+  if (name === "query_revenue") {
+    const client = args.client as string | undefined
+    if (client && ["enterprise", "mid-market", "smb"].includes(client.toLowerCase())) {
+      return { ...args, segment: client, client: undefined }
+    }
+  }
+  return args
+}
+
 export async function executeTool(
   functionCall: FunctionCall,
 ): Promise<ToolExecutionResult> {
-  const { name, arguments: args } = functionCall
+  const resolvedName = resolveToolName(functionCall.name)
+  const args = fixArguments(resolvedName, functionCall.arguments)
 
-  switch (name) {
+  console.log(`[cloudNein:exec] Tool: ${functionCall.name}${resolvedName !== functionCall.name ? ` → ${resolvedName}` : ""}, Args: ${JSON.stringify(args)}`)
+
+  switch (resolvedName) {
     case "query_expenses":
       return executeQueryExpenses(args)
     case "get_budget_status":
@@ -39,7 +75,7 @@ export async function executeTool(
     case "cloud_analyze":
       return executeCloudAnalyze(args)
     default:
-      return { output: `Unknown tool: ${name}`, source: "on-device" }
+      return { output: `Unknown tool: ${resolvedName}`, source: "on-device" }
   }
 }
 

@@ -23,6 +23,51 @@ export interface CactusCompletable {
 }
 
 /**
+ * Keyword-based pre-router: narrows 7 tools down to 2-3 relevant ones
+ * so FunctionGemma 270M doesn't get overwhelmed.
+ */
+function preRouteTools(userMessage: string, tools: Tool[]): Tool[] {
+  const msg = userMessage.toLowerCase()
+  const toolMap = new Map(tools.map((t) => [t.name, t]))
+
+  const pick = (names: string[]): Tool[] =>
+    names.map((n) => toolMap.get(n)).filter((t): t is Tool => t !== undefined)
+
+  // Budget keywords
+  if (/budget|over\s?budget|under\s?budget|remaining|limit/.test(msg)) {
+    return pick(["get_budget_status", "query_expenses"])
+  }
+
+  // Wire / approval keywords
+  if (/wire|approv|pending|transfer|authorize/.test(msg)) {
+    return pick(["get_wire_approvals", "query_expenses"])
+  }
+
+  // Revenue keywords
+  if (/revenue|income|sales|client|segment|arr|mrr|enterprise|mid.market|smb/.test(msg)) {
+    return pick(["query_revenue", "query_expenses"])
+  }
+
+  // Expense / spend / vendor / pay keywords
+  if (/spend|expense|cost|pay|paid|vendor|total|how much/.test(msg)) {
+    return pick(["query_expenses", "get_budget_status"])
+  }
+
+  // PII / sensitive data keywords (handled by sensitivity router, but just in case)
+  if (/ssn|social security|credit card|account number|redact/.test(msg)) {
+    return pick(["detect_pii", "redact_and_analyze"])
+  }
+
+  // Cloud / analyze / advice keywords
+  if (/analyze|advice|compare|trend|benchmark|strategy/.test(msg)) {
+    return pick(["cloud_analyze", "query_expenses"])
+  }
+
+  // Default: give the 4 most common local tools
+  return pick(["query_expenses", "get_budget_status", "query_revenue", "get_wire_approvals"])
+}
+
+/**
  * Run tool calling on-device via FunctionGemma + Cactus.
  */
 async function generateLocal(
@@ -36,20 +81,25 @@ async function generateLocal(
 }> {
   const systemMessage: Message = {
     role: "system",
-    content:
-      "You are a privacy-aware financial assistant. You have access to a local expense database and can detect/redact PII. Choose the most appropriate tool for the user's request.",
+    content: "You are a helpful assistant that can use tools.",
   }
+
+  console.log(`[cloudNein:local] Sending ${tools.length} tools: [${tools.map((t) => t.name).join(", ")}]`)
 
   const result = await cactusLM.complete({
     messages: [systemMessage, ...messages],
     tools,
     options: {
       forceTools: true,
-      maxTokens: 256,
+      maxTokens: 128,
       stopSequences: ["<|im_end|>", "<end_of_turn>"],
     },
     mode: "local",
   })
+
+  console.log(`[cloudNein:local] Raw response: ${result.response.slice(0, 200)}`)
+  console.log(`[cloudNein:local] Function calls: ${JSON.stringify(result.functionCalls)}`)
+  console.log(`[cloudNein:local] Time: ${result.totalTimeMs}ms, Tokens: ${result.totalTokens}, TPS: ${result.tokensPerSecond?.toFixed(1)}`)
 
   const functionCalls: FunctionCall[] = (result.functionCalls ?? []).map((fc) => ({
     name: fc.name,
@@ -61,6 +111,20 @@ async function generateLocal(
     totalTimeMs: result.totalTimeMs,
     response: result.response,
   }
+}
+
+/**
+ * Resolve fuzzy tool names for confidence checking too.
+ */
+const TOOL_ALIASES: Record<string, string> = {
+  get_wire_approval: "get_wire_approvals",
+  wire_approvals: "get_wire_approvals",
+  budget_status: "get_budget_status",
+  expenses: "query_expenses",
+  revenue: "query_revenue",
+  detect_pii_entities: "detect_pii",
+  redact: "redact_and_analyze",
+  cloud: "cloud_analyze",
 }
 
 /**
@@ -77,13 +141,17 @@ function estimateConfidence(
   let confidence = 0.7
 
   const toolNames = new Set(tools.map((t) => t.name))
-  const allValid = localResult.functionCalls.every((fc) => toolNames.has(fc.name))
+  const allValid = localResult.functionCalls.every((fc) => {
+    const resolved = TOOL_ALIASES[fc.name] ?? fc.name
+    return toolNames.has(fc.name) || toolNames.has(resolved)
+  })
   if (!allValid) {
     return 0.15
   }
 
   for (const fc of localResult.functionCalls) {
-    const tool = tools.find((t) => t.name === fc.name)
+    const resolved = TOOL_ALIASES[fc.name] ?? fc.name
+    const tool = tools.find((t) => t.name === fc.name || t.name === resolved)
     if (!tool) continue
     const required = tool.parameters.required ?? []
     const hasAll = required.every((key) => key in fc.arguments)
@@ -97,6 +165,35 @@ function estimateConfidence(
   }
 
   return Math.max(0, Math.min(1, confidence))
+}
+
+/**
+ * Keyword-based fallback: when FunctionGemma fails to produce a tool call,
+ * try to extract intent from the user message and call the right tool directly.
+ */
+function fallbackToolCall(userMessage: string, tools: Tool[]): FunctionCall | null {
+  const msg = userMessage.toLowerCase()
+  const toolNames = new Set(tools.map((t) => t.name))
+
+  // "how much did we pay [vendor]" → query_expenses with vendor
+  const payMatch = msg.match(/(?:pay|paid|spend|spent)\s+(?:on\s+|to\s+|with\s+|for\s+)?(.+?)(?:\?|$|\.|last|this)/)
+  if (payMatch && toolNames.has("query_expenses")) {
+    const vendor = payMatch[1].trim().replace(/[?"]/g, "")
+    if (vendor.length > 1) {
+      console.log(`[cloudNein:fallback] Extracted vendor "${vendor}" from pay/spend pattern`)
+      return { name: "query_expenses", arguments: { vendor } }
+    }
+  }
+
+  // "show [category] expenses" → query_expenses with category
+  const catMatch = msg.match(/(?:show|list|get)\s+(?:me\s+)?(?:all\s+)?(\w+)\s+expense/)
+  if (catMatch && toolNames.has("query_expenses")) {
+    const category = catMatch[1].charAt(0).toUpperCase() + catMatch[1].slice(1)
+    console.log(`[cloudNein:fallback] Extracted category "${category}" from expense pattern`)
+    return { name: "query_expenses", arguments: { category } }
+  }
+
+  return null
 }
 
 /**
@@ -165,8 +262,10 @@ export async function generateHybrid(
     }
   }
 
-  // ── Step 3: Filter tools by sensitivity ──────────────────────────────
-  const availableTools = filterToolsBySensitivity(tools, sensitivityLevel)
+  // ── Step 3: Filter tools by sensitivity, then pre-route by keywords ──
+  const sensitivityFiltered = filterToolsBySensitivity(tools, sensitivityLevel)
+  const availableTools = preRouteTools(userMessage, sensitivityFiltered)
+  console.log(`[cloudNein:router] Sensitivity: ${sensitivityLevel}, PII: ${piiEntities.length}, Tools: [${availableTools.map((t) => t.name).join(", ")}]`)
 
   // ── Step 4: FunctionGemma picks a tool ───────────────────────────────
   const local = await generateLocal(cactusLM, messages, availableTools)
@@ -211,7 +310,25 @@ export async function generateHybrid(
     }
   }
 
-  // ── Fallback: no tool selected ───────────────────────────────────────
+  // ── Fallback: keyword-based intent extraction ──────────────────────
+  const fallback = fallbackToolCall(userMessage, availableTools)
+  if (fallback) {
+    console.log(`[cloudNein:fallback] Using keyword fallback: ${fallback.name}(${JSON.stringify(fallback.arguments)})`)
+    const execResult = await executeTool(fallback)
+    return {
+      source: execResult.source,
+      functionCalls: [fallback],
+      response: execResult.output,
+      totalTimeMs: Date.now() - startTime,
+      confidence: 0.6,
+      sensitivityLevel,
+      piiDetected: piiEntities.length,
+      redactedPreview: execResult.redactedPreview,
+      toolExecutionResult: execResult.output,
+    }
+  }
+
+  // ── Final fallback: no tool selected ──────────────────────────────
   return {
     source: "on-device",
     functionCalls: [],
