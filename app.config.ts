@@ -36,10 +36,6 @@ module.exports = ({ config }: ConfigContext): Partial<ExpoConfig> => {
         ],
       },
     },
-    plugins: [
-      ...existingPlugins,
-      "expo-sqlite",
-      "./plugins/withArm64Only",
-    ],
+    plugins: [...existingPlugins, "expo-sqlite"],
   }
 }

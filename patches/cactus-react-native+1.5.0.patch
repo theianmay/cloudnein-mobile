@@ -1,0 +1,15 @@
+diff --git a/node_modules/cactus-react-native/android/build.gradle b/node_modules/cactus-react-native/android/build.gradle
+index 4cf1a80..3400f3c 100644
+--- a/node_modules/cactus-react-native/android/build.gradle
++++ b/node_modules/cactus-react-native/android/build.gradle
+@@ -16,8 +16,8 @@ buildscript {
+ }
+ 
+ def reactNativeArchitectures() {
+-  def value = rootProject.getProperties().get("reactNativeArchitectures")
+-  return value ? value.split(",") : ["arm64-v8a"]
++  // Only arm64-v8a prebuilt libs are shipped with cactus-react-native
++  return ["arm64-v8a"]
+ }
+ 
+ apply plugin: "com.android.library"
