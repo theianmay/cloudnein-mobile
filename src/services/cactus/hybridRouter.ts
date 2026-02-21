@@ -1,7 +1,15 @@
 import type { CactusLMCompleteParams, CactusLMCompleteResult } from "cactus-react-native"
 
-import { detectPII, scoreSensitivity, redactText } from "@/services/privacy"
-import type { SensitivityLevel } from "@/services/privacy"
+import {
+  detectPII,
+  scoreSensitivity,
+  redactText,
+  deAnonymize,
+  anonymizeWithMap,
+  createNodeMap,
+  registerEntity,
+} from "@/services/privacy"
+import type { SensitivityLevel, NodeMap } from "@/services/privacy"
 import {
   queryExpenses,
   getBudgetStatus,
@@ -198,6 +206,24 @@ function fallbackToolCall(userMessage: string, tools: Tool[]): FunctionCall | nu
     return { name: "query_expenses", arguments: { category } }
   }
 
+  const revMatch = msg.match(/(?:revenue|income|sales|arr|mrr)\s+(?:from|for|of|with)\s+(.+?)(?:\?|$|\.|last|this)/)
+  if (revMatch && toolNames.has("query_revenue")) {
+    const client = revMatch[1].trim().replace(/[?"]/g, "")
+    if (client.length > 1) {
+      console.log(`[cloudNein:fallback] Extracted client "${client}" from revenue pattern`)
+      return { name: "query_revenue", arguments: { client } }
+    }
+  }
+
+  const revMatch2 = msg.match(/(?:how much|what)\s+(?:did\s+)?(?:we\s+)?(?:make|earn|get|receive)\s+(?:from|for|with)\s+(.+?)(?:\?|$|\.|last|this)/)
+  if (revMatch2 && toolNames.has("query_revenue")) {
+    const client = revMatch2[1].trim().replace(/[?"]/g, "")
+    if (client.length > 1) {
+      console.log(`[cloudNein:fallback] Extracted client "${client}" from earnings pattern`)
+      return { name: "query_revenue", arguments: { client } }
+    }
+  }
+
   return null
 }
 
@@ -210,14 +236,25 @@ function filterToolsBySensitivity(tools: Tool[], level: SensitivityLevel): Tool[
   return tools
 }
 
-// ── Local Context Gathering (for analytical cloud path) ─────────────────
+// ── Local Context Gathering + Reversible Subgraph ───────────────────────
+//
+// For analytical queries sent to the cloud, we:
+//   1. Gather local financial data (vendors, clients, employees, amounts)
+//   2. Register all named entities in a NodeMap (Vendor_A, Client_B, etc.)
+//   3. Anonymize the context using the NodeMap before sending to Gemini
+//   4. Gemini reasons over the anonymized structural/financial relationships
+//   5. De-anonymize the response locally using the NodeMap
+//
+// The NodeMap NEVER leaves the device. This is the "reversible subgraph."
 
-function gatherLocalContext(userMessage: string): string {
+function gatherLocalContext(userMessage: string): { context: string; nodeMap: NodeMap } {
   const msg = userMessage.toLowerCase()
   const parts: string[] = []
+  const nodeMap = createNodeMap()
+  const counters = new Map<string, number>()
 
   try {
-    // Always include budget status — most useful for strategic questions
+    // Always include budget status
     const budgets = getBudgetStatus()
     if (budgets.length > 0) {
       const budgetLines = budgets.map((s) => {
@@ -227,39 +264,65 @@ function gatherLocalContext(userMessage: string): string {
       parts.push(`BUDGET STATUS:\n${budgetLines.join("\n")}`)
     }
 
-    // Include relevant expense data
+    // Include expense data + register vendors
+    const totalSpend = getTotalSpend()
+    parts.push(`TOTAL EXPENSES (all time): $${totalSpend.toFixed(0)}`)
+
+    const expenses = queryExpenses()
+    const vendors = new Set(expenses.map((e) => e.vendor))
+    for (const vendor of vendors) {
+      registerEntity(nodeMap, vendor, "VENDOR", counters)
+    }
+
     if (/marketing|spend|expense|cost|cut|reduce|burn/.test(msg)) {
-      const totalSpend = getTotalSpend()
-      parts.push(`TOTAL EXPENSES (all time): $${totalSpend.toFixed(0)}`)
+      const topExpenses = expenses.slice(0, 10).map(
+        (e) => `${e.date}: ${e.vendor} — $${e.amount.toFixed(0)} (${e.category})`,
+      )
+      parts.push(`RECENT EXPENSES:\n${topExpenses.join("\n")}`)
     }
 
-    // Include revenue if relevant
-    if (/revenue|income|growth|cash|runway|burn|profit/.test(msg)) {
-      const totalRev = getTotalRevenue()
-      parts.push(`TOTAL REVENUE (all time): $${totalRev.toFixed(0)}`)
+    // Include revenue + register clients
+    const totalRev = getTotalRevenue()
+    parts.push(`TOTAL REVENUE (all time): $${totalRev.toFixed(0)}`)
 
-      const recentRev = queryRevenue({})
-      if (recentRev.length > 0) {
-        const topClients = recentRev.slice(0, 5).map(
-          (r) => `${r.client} (${r.segment}): $${r.amount.toFixed(0)} - ${r.type}`,
-        )
-        parts.push(`RECENT REVENUE:\n${topClients.join("\n")}`)
+    const recentRev = queryRevenue({})
+    if (recentRev.length > 0) {
+      for (const r of recentRev) {
+        registerEntity(nodeMap, r.client, "CLIENT", counters)
       }
+      const topClients = recentRev.slice(0, 5).map(
+        (r) => `${r.client} (${r.segment}): $${r.amount.toFixed(0)} - ${r.type}`,
+      )
+      parts.push(`RECENT REVENUE:\n${topClients.join("\n")}`)
     }
 
-    // Include wire approvals if relevant
-    if (/approv|wire|pending|cash|runway/.test(msg)) {
-      const pending = getWireApprovals("pending")
+    // Include wire approvals + register requesters
+    const allWires = getWireApprovals()
+    if (allWires.length > 0) {
+      for (const w of allWires) {
+        registerEntity(nodeMap, w.vendor, "VENDOR", counters)
+        registerEntity(nodeMap, w.requested_by, "EMPLOYEE", counters)
+      }
+      const pending = allWires.filter((w) => w.status === "pending")
       if (pending.length > 0) {
+        const pendingLines = pending.map(
+          (w) => `${w.vendor}: $${w.amount.toFixed(0)} — requested by ${w.requested_by}`,
+        )
         const pendingTotal = pending.reduce((s, w) => s + w.amount, 0)
-        parts.push(`PENDING WIRE APPROVALS: ${pending.length} totaling $${pendingTotal.toFixed(0)}`)
+        parts.push(`PENDING WIRE APPROVALS (${pending.length}, totaling $${pendingTotal.toFixed(0)}):\n${pendingLines.join("\n")}`)
       }
     }
   } catch (e) {
     console.warn("[cloudNein:context] Error gathering local context:", e)
   }
 
-  return parts.join("\n\n")
+  const context = parts.join("\n\n")
+  console.log(`[cloudNein:subgraph] NodeMap: ${nodeMap.toNode.size} entities registered`)
+  for (const [real, node] of nodeMap.toNode) {
+    console.log(`[cloudNein:subgraph]   ${node} = "${real}"`)
+  }
+
+  return { context, nodeMap }
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -322,13 +385,25 @@ export async function generateHybrid(
   const classification = classifyQuery(userMessage)
   console.log(`[cloudNein:pipeline] Stage 1 — Type: ${classification.type}, Reason: ${classification.reason}`)
 
-  // ── Analytical path: gather local data → send to Gemini for reasoning ─
+  // ── Analytical path: gather local data → anonymize → Gemini → de-anonymize
   if (classification.type === "analytical") {
-    console.log(`[cloudNein:pipeline] → CLOUD-ANALYSIS path`)
-    const localContext = gatherLocalContext(userMessage)
-    console.log(`[cloudNein:pipeline] Local context (${localContext.length} chars): ${localContext.slice(0, 200)}...`)
+    console.log(`[cloudNein:pipeline] → CLOUD-ANALYSIS path (reversible subgraph)`)
 
-    const prompt = `You are a CFO's financial advisor. Answer the question using ONLY the financial data provided below. Be specific with numbers.\n\n=== COMPANY FINANCIAL DATA ===\n${localContext}\n\n=== QUESTION ===\n${userMessage}`
+    // Step A: Gather local financial data + build NodeMap of all entities
+    const { context: rawContext, nodeMap } = gatherLocalContext(userMessage)
+
+    // Step B: Also redact any PII in the user's question into the same NodeMap
+    const { redactedText: anonymizedQuestion } = redactText(userMessage, piiEntities, nodeMap)
+
+    // Step C: Anonymize the entire context using the NodeMap
+    const anonymizedContext = anonymizeWithMap(rawContext, nodeMap)
+
+    console.log(`[cloudNein:subgraph] Raw context (${rawContext.length} chars)`)
+    console.log(`[cloudNein:subgraph] Anonymized context (${anonymizedContext.length} chars): ${anonymizedContext.slice(0, 200)}...`)
+    console.log(`[cloudNein:subgraph] Anonymized question: "${anonymizedQuestion}"`)
+
+    // Step D: Send anonymized data to Gemini — no real names leave the device
+    const prompt = `You are a CFO's financial advisor. Answer the question using ONLY the financial data provided below. Be specific with numbers. Use the entity names exactly as given (e.g. Vendor_A, Client_B).\n\n=== COMPANY FINANCIAL DATA ===\n${anonymizedContext}\n\n=== QUESTION ===\n${anonymizedQuestion}`
 
     try {
       const cloud = await generateCloud(
@@ -336,17 +411,24 @@ export async function generateHybrid(
         [],
       )
 
+      // Step E: De-anonymize the cloud response locally — swap nodes back to real names
+      const rawCloudResponse = cloud.response || "Cloud analysis complete."
+      const deAnonymizedResponse = deAnonymize(rawCloudResponse, nodeMap)
+
+      console.log(`[cloudNein:subgraph] Cloud response (anonymized): ${rawCloudResponse.slice(0, 200)}...`)
+      console.log(`[cloudNein:subgraph] De-anonymized response: ${deAnonymizedResponse.slice(0, 200)}...`)
+
       return {
         source: "cloud",
         routingPath: "cloud-analysis",
-        routingReason: `${classification.reason} → local data gathered → Gemini reasoning`,
+        routingReason: `${classification.reason} → ${nodeMap.toNode.size} entities anonymized → Gemini reasoning → de-anonymized locally`,
         functionCalls: [],
-        response: cloud.response || "Cloud analysis complete.",
+        response: deAnonymizedResponse,
         totalTimeMs: Date.now() - startTime,
         sensitivityLevel,
         piiDetected: piiEntities.length,
-        toolExecutionResult: cloud.response || "Cloud analysis complete.",
-        localContext: localContext.slice(0, 300),
+        toolExecutionResult: deAnonymizedResponse,
+        localContext: anonymizedContext.slice(0, 300),
       }
     } catch (error) {
       console.warn(`[cloudNein:pipeline] Cloud analysis failed, falling through to tool path:`, error)

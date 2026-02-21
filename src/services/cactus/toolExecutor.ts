@@ -183,8 +183,18 @@ function executeQueryRevenue(args: Record<string, unknown>): ToolExecutionResult
   const startDate = args.start_date as string | undefined
   const endDate = args.end_date as string | undefined
 
-  const records = queryRevenue({ client, segment, startDate, endDate })
-  const total = getTotalRevenue({ client, segment, startDate, endDate })
+  let records = queryRevenue({ client, segment, startDate, endDate })
+  let total = getTotalRevenue({ client, segment, startDate, endDate })
+  let usedSegment = segment
+
+  // If client + segment returned nothing, retry without segment
+  // (FunctionGemma 270M often hallucinates the wrong segment)
+  if (records.length === 0 && client && segment) {
+    console.log(`[cloudNein:exec] No results for client="${client}" + segment="${segment}", retrying without segment`)
+    records = queryRevenue({ client, startDate, endDate })
+    total = getTotalRevenue({ client, startDate, endDate })
+    usedSegment = undefined
+  }
 
   if (records.length === 0) {
     const filter = client || segment || "all clients"
@@ -200,7 +210,7 @@ function executeQueryRevenue(args: Record<string, unknown>): ToolExecutionResult
     : ""
 
   const summary = [
-    `Found ${records.length} revenue record(s)${client ? ` from ${client}` : ""}${segment ? ` in ${segment}` : ""}${dateRange}.`,
+    `Found ${records.length} revenue record(s)${client ? ` from ${client}` : ""}${usedSegment ? ` in ${usedSegment}` : ""}${dateRange}.`,
     `Total revenue: $${total.toFixed(2)}`,
     "",
     ...lines,
