@@ -1,8 +1,9 @@
 import { useEffect, useState } from "react"
-import { Slot, SplashScreen } from "expo-router"
+import { SplashScreen, Tabs } from "expo-router"
 import { useFonts } from "@expo-google-fonts/space-grotesk"
 import { KeyboardProvider } from "react-native-keyboard-controller"
 import { initialWindowMetrics, SafeAreaProvider } from "react-native-safe-area-context"
+import { Text } from "react-native"
 
 import { initI18n } from "@/i18n"
 import { ThemeProvider } from "@/theme/context"
@@ -48,7 +49,33 @@ export default function Root() {
     <SafeAreaProvider initialMetrics={initialWindowMetrics}>
       <ThemeProvider>
         <KeyboardProvider>
-          <Slot />
+          <Tabs
+            screenOptions={{
+              headerShown: false,
+              tabBarStyle: {
+                backgroundColor: "#1a1a2e",
+                borderTopColor: "#2a2a4a",
+              },
+              tabBarActiveTintColor: "#6366f1",
+              tabBarInactiveTintColor: "#888",
+              tabBarLabelStyle: { fontSize: 12, fontWeight: "600" },
+            }}
+          >
+            <Tabs.Screen
+              name="index"
+              options={{
+                title: "Chat",
+                tabBarIcon: ({ color }) => <Text style={{ color, fontSize: 20 }}>{"💬"}</Text>,
+              }}
+            />
+            <Tabs.Screen
+              name="data"
+              options={{
+                title: "Local Data",
+                tabBarIcon: ({ color }) => <Text style={{ color, fontSize: 20 }}>{"🗄️"}</Text>,
+              }}
+            />
+          </Tabs>
         </KeyboardProvider>
       </ThemeProvider>
     </SafeAreaProvider>
