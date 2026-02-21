@@ -1,5 +1,5 @@
-import { WelcomeScreen } from "@/screens/WelcomeScreen"
+import { ChatScreen } from "@/screens/ChatScreen"
 
 export default function Index() {
-  return <WelcomeScreen />
+  return <ChatScreen />
 }
