@@ -1,7 +1,6 @@
 import { getDB } from "./index"
 
 export interface ExpenseRow {
-  [key: string]: string | number | null
   id: number
   date: string
   category: string
@@ -11,13 +10,11 @@ export interface ExpenseRow {
 }
 
 export interface BudgetRow {
-  [key: string]: string | number | null
   category: string
   monthly_limit: number
 }
 
 export interface BudgetStatusRow {
-  [key: string]: string | number | null
   category: string
   monthly_limit: number
   total_spent: number
@@ -52,36 +49,34 @@ export function queryExpenses(filters?: {
   }
 
   const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : ""
-  const result = db.execute<ExpenseRow>(
+  return db.getAllSync<ExpenseRow>(
     `SELECT id, date, category, vendor, amount, notes FROM expenses ${where} ORDER BY date DESC`,
     params,
   )
-
-  return result.rows._array
 }
 
 export function getTotalSpend(category?: string): number {
   const db = getDB()
 
   if (category) {
-    const result = db.execute<{ total: number }>(
+    const result = db.getFirstSync<{ total: number }>(
       "SELECT COALESCE(SUM(amount), 0) as total FROM expenses WHERE LOWER(category) = LOWER(?)",
       [category],
     )
-    return result.rows._array[0]?.total ?? 0
+    return result?.total ?? 0
   }
 
-  const result = db.execute<{ total: number }>(
+  const result = db.getFirstSync<{ total: number }>(
     "SELECT COALESCE(SUM(amount), 0) as total FROM expenses",
   )
-  return result.rows._array[0]?.total ?? 0
+  return result?.total ?? 0
 }
 
 export function getBudgetStatus(category?: string): BudgetStatusRow[] {
   const db = getDB()
 
   if (category) {
-    const result = db.execute<BudgetStatusRow>(
+    return db.getAllSync<BudgetStatusRow>(
       `SELECT
         b.category,
         b.monthly_limit,
@@ -93,10 +88,9 @@ export function getBudgetStatus(category?: string): BudgetStatusRow[] {
       GROUP BY b.category, b.monthly_limit`,
       [category],
     )
-    return result.rows._array
   }
 
-  const result = db.execute<BudgetStatusRow>(
+  return db.getAllSync<BudgetStatusRow>(
     `SELECT
       b.category,
       b.monthly_limit,
@@ -107,13 +101,12 @@ export function getBudgetStatus(category?: string): BudgetStatusRow[] {
     GROUP BY b.category, b.monthly_limit
     ORDER BY remaining ASC`,
   )
-  return result.rows._array
 }
 
 export function getCategories(): string[] {
   const db = getDB()
-  const result = db.execute<{ category: string }>(
+  const rows = db.getAllSync<{ category: string }>(
     "SELECT DISTINCT category FROM expenses ORDER BY category",
   )
-  return result.rows._array.map((r) => r.category)
+  return rows.map((r) => r.category)
 }
