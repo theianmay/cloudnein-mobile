@@ -57,14 +57,15 @@ function convertToolsToGemini(tools: Tool[]) {
 export async function generateCloud(
   messages: Message[],
   tools: Tool[],
-): Promise<{ functionCalls: FunctionCall[]; totalTimeMs: number }> {
+): Promise<{ functionCalls: FunctionCall[]; totalTimeMs: number; response: string }> {
   if (!geminiClient) {
     throw new Error("Gemini client not initialized. Call initGemini(apiKey) first.")
   }
 
+  const hasTools = tools.length > 0
   const model = geminiClient.getGenerativeModel({
     model: "gemini-2.0-flash",
-    tools: convertToolsToGemini(tools),
+    ...(hasTools ? { tools: convertToolsToGemini(tools) } : {}),
   })
 
   const contents = messages
@@ -77,10 +78,11 @@ export async function generateCloud(
   const totalTimeMs = Date.now() - startTime
 
   const functionCalls: FunctionCall[] = []
-  const response = result.response
+  let textResponse = ""
+  const geminiResponse = result.response
 
-  if (response.candidates) {
-    for (const candidate of response.candidates) {
+  if (geminiResponse.candidates) {
+    for (const candidate of geminiResponse.candidates) {
       if (candidate.content?.parts) {
         for (const part of candidate.content.parts) {
           if (part.functionCall) {
@@ -89,10 +91,13 @@ export async function generateCloud(
               arguments: (part.functionCall.args as Record<string, unknown>) ?? {},
             })
           }
+          if (part.text) {
+            textResponse += part.text
+          }
         }
       }
     }
   }
 
-  return { functionCalls, totalTimeMs }
+  return { functionCalls, totalTimeMs, response: textResponse }
 }

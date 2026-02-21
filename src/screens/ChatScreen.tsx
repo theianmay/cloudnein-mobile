@@ -297,8 +297,10 @@ export const ChatScreen: FC = function ChatScreen() {
               text="Your private financial assistant. Sensitive data never leaves your device raw."
             />
             <View style={themed($emptyHints)}>
-              <Text style={themed($emptyHint)} text={'Try: "What was my total spend in February?"'} />
+              <Text style={themed($emptyHint)} text={'Try: "Show me pending wire approvals"'} />
               <Text style={themed($emptyHint)} text={'Try: "Am I over budget on marketing?"'} />
+              <Text style={themed($emptyHint)} text={'Try: "How much revenue from enterprise clients?"'} />
+              <Text style={themed($emptyHint)} text={'Try: "How much did we pay Baker McKenzie?"'} />
               <Text style={themed($emptyHint)} text={'Try: "John Smith SSN 123-45-6789 approved $50K"'} />
             </View>
           </View>

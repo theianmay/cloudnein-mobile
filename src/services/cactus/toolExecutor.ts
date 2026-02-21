@@ -1,4 +1,12 @@
-import { queryExpenses, getTotalSpend, getBudgetStatus } from "@/services/database/queries"
+import {
+  queryExpenses,
+  getTotalSpend,
+  getBudgetStatus,
+  queryRevenue,
+  getTotalRevenue,
+  getWireApprovals,
+  getVendorHistory,
+} from "@/services/database/queries"
 import { detectPII, redactText, scoreSensitivity } from "@/services/privacy"
 import { generateCloud } from "./geminiCloud"
 import type { FunctionCall, Message } from "./types"
@@ -20,6 +28,10 @@ export async function executeTool(
       return executeQueryExpenses(args)
     case "get_budget_status":
       return executeGetBudgetStatus(args)
+    case "query_revenue":
+      return executeQueryRevenue(args)
+    case "get_wire_approvals":
+      return executeGetWireApprovals(args)
     case "detect_pii":
       return executeDetectPII(args)
     case "redact_and_analyze":
@@ -31,35 +43,73 @@ export async function executeTool(
   }
 }
 
+// ── Expense Queries ──────────────────────────────────────────────────────
+
 function executeQueryExpenses(args: Record<string, unknown>): ToolExecutionResult {
   const category = args.category as string | undefined
   const vendor = args.vendor as string | undefined
+  const startDate = args.start_date as string | undefined
+  const endDate = args.end_date as string | undefined
 
-  const expenses = queryExpenses({ category, vendor })
+  // If vendor is specified, use the richer vendor history view
+  if (vendor && !category && !startDate && !endDate) {
+    const history = getVendorHistory(vendor)
+    if (history.expenses.length === 0) {
+      return { output: `No expenses found for vendor "${vendor}".`, source: "on-device" }
+    }
+
+    const lines = history.expenses.slice(0, 10).map(
+      (e) => `${e.date} | ${e.category} | $${e.amount.toFixed(2)}${e.notes ? ` | ${e.notes}` : ""}`,
+    )
+
+    const parts = [
+      `Vendor: ${vendor}`,
+      `Total historical spend: $${history.totalSpend.toFixed(2)}`,
+      `${history.expenses.length} transaction(s) on record`,
+      "",
+      ...lines,
+      history.expenses.length > 10 ? `... and ${history.expenses.length - 10} more` : "",
+    ]
+
+    if (history.wiresPending.length > 0) {
+      parts.push("")
+      parts.push(`⚠ ${history.wiresPending.length} pending wire(s):`)
+      history.wiresPending.forEach((w) => {
+        parts.push(`  ${w.date} | $${w.amount.toFixed(2)} | ${w.notes ?? ""}`)
+      })
+    }
+
+    return { output: parts.filter(Boolean).join("\n"), source: "on-device" }
+  }
+
+  const expenses = queryExpenses({ category, vendor, startDate, endDate })
   const total = getTotalSpend(category)
 
   if (expenses.length === 0) {
     const filter = category || vendor || "all categories"
-    return {
-      output: `No expenses found for ${filter}.`,
-      source: "on-device",
-    }
+    return { output: `No expenses found for ${filter}.`, source: "on-device" }
   }
 
-  const lines = expenses.slice(0, 10).map(
+  const lines = expenses.slice(0, 12).map(
     (e) => `${e.date} | ${e.category} | ${e.vendor} | $${e.amount.toFixed(2)}${e.notes ? ` | ${e.notes}` : ""}`,
   )
 
+  const dateRange = startDate || endDate
+    ? ` (${startDate ?? "..."} to ${endDate ?? "now"})`
+    : ""
+
   const summary = [
-    `Found ${expenses.length} expense(s)${category ? ` in ${category}` : ""}${vendor ? ` from ${vendor}` : ""}.`,
+    `Found ${expenses.length} expense(s)${category ? ` in ${category}` : ""}${vendor ? ` from ${vendor}` : ""}${dateRange}.`,
     `Total: $${total.toFixed(2)}`,
     "",
     ...lines,
-    expenses.length > 10 ? `... and ${expenses.length - 10} more` : "",
-  ].join("\n")
+    expenses.length > 12 ? `... and ${expenses.length - 12} more` : "",
+  ].filter(Boolean).join("\n")
 
   return { output: summary, source: "on-device" }
 }
+
+// ── Budget Status ────────────────────────────────────────────────────────
 
 function executeGetBudgetStatus(args: Record<string, unknown>): ToolExecutionResult {
   const category = args.category as string | undefined
@@ -74,15 +124,116 @@ function executeGetBudgetStatus(args: Record<string, unknown>): ToolExecutionRes
 
   const lines = statuses.map((s) => {
     const pct = ((s.total_spent / s.monthly_limit) * 100).toFixed(0)
-    const status = s.remaining < 0 ? "OVER BUDGET" : s.remaining < s.monthly_limit * 0.2 ? "WARNING" : "OK"
-    return `${s.category}: $${s.total_spent.toFixed(2)} / $${s.monthly_limit.toFixed(2)} (${pct}%) [${status}] — $${s.remaining.toFixed(2)} remaining`
+    const status = s.remaining < 0 ? "🔴 OVER BUDGET" : s.remaining < s.monthly_limit * 0.2 ? "🟡 WARNING" : "🟢 OK"
+    return `${s.category}: $${s.total_spent.toFixed(2)} / $${s.monthly_limit.toFixed(2)} (${pct}%) ${status} — $${Math.abs(s.remaining).toFixed(2)} ${s.remaining < 0 ? "over" : "remaining"}`
   })
 
+  const overBudget = statuses.filter((s) => s.remaining < 0)
+  const header = overBudget.length > 0
+    ? `Budget Status (${overBudget.length} category(ies) over budget):`
+    : "Budget Status (all within limits):"
+
   return {
-    output: ["Budget Status:", ...lines].join("\n"),
+    output: [header, ...lines].join("\n"),
     source: "on-device",
   }
 }
+
+// ── Revenue Queries ──────────────────────────────────────────────────────
+
+function executeQueryRevenue(args: Record<string, unknown>): ToolExecutionResult {
+  const client = args.client as string | undefined
+  const segment = args.segment as string | undefined
+  const startDate = args.start_date as string | undefined
+  const endDate = args.end_date as string | undefined
+
+  const records = queryRevenue({ client, segment, startDate, endDate })
+  const total = getTotalRevenue({ client, segment, startDate, endDate })
+
+  if (records.length === 0) {
+    const filter = client || segment || "all clients"
+    return { output: `No revenue records found for ${filter}.`, source: "on-device" }
+  }
+
+  const lines = records.slice(0, 12).map(
+    (r) => `${r.date} | ${r.client} | ${r.segment} | $${r.amount.toFixed(2)} (${r.type})${r.notes ? ` | ${r.notes}` : ""}`,
+  )
+
+  const dateRange = startDate || endDate
+    ? ` (${startDate ?? "..."} to ${endDate ?? "now"})`
+    : ""
+
+  const summary = [
+    `Found ${records.length} revenue record(s)${client ? ` from ${client}` : ""}${segment ? ` in ${segment}` : ""}${dateRange}.`,
+    `Total revenue: $${total.toFixed(2)}`,
+    "",
+    ...lines,
+    records.length > 12 ? `... and ${records.length - 12} more` : "",
+  ].filter(Boolean).join("\n")
+
+  return { output: summary, source: "on-device" }
+}
+
+// ── Wire Approvals ───────────────────────────────────────────────────────
+
+function executeGetWireApprovals(args: Record<string, unknown>): ToolExecutionResult {
+  const status = args.status as string | undefined
+  const vendor = args.vendor as string | undefined
+
+  // If vendor specified, show vendor-specific wire + history context
+  if (vendor) {
+    const history = getVendorHistory(vendor)
+    const wires = getWireApprovals(status)
+    const vendorWires = wires.filter((w) =>
+      w.vendor.toLowerCase().includes(vendor.toLowerCase()),
+    )
+
+    if (vendorWires.length === 0) {
+      return { output: `No wire approvals found for vendor "${vendor}".`, source: "on-device" }
+    }
+
+    const wireLines = vendorWires.map(
+      (w) => `${w.date} | $${w.amount.toFixed(2)} | ${w.status.toUpperCase()} | ${w.requested_by} | ${w.notes ?? ""}`,
+    )
+
+    const parts = [
+      `Wire approvals for ${vendor}:`,
+      ...wireLines,
+      "",
+      `Historical context: $${history.totalSpend.toFixed(2)} total spend across ${history.expenses.length} transaction(s)`,
+    ]
+
+    return { output: parts.join("\n"), source: "on-device" }
+  }
+
+  const wires = getWireApprovals(status)
+
+  if (wires.length === 0) {
+    return {
+      output: status ? `No ${status} wire approvals.` : "No wire approvals found.",
+      source: "on-device",
+    }
+  }
+
+  const lines = wires.map(
+    (w) => `${w.date} | ${w.vendor} | $${w.amount.toFixed(2)} | ${w.status.toUpperCase()} | ${w.requested_by}${w.notes ? ` | ${w.notes}` : ""}`,
+  )
+
+  const pendingTotal = wires
+    .filter((w) => w.status === "pending")
+    .reduce((sum, w) => sum + w.amount, 0)
+
+  const header = status === "pending"
+    ? `${wires.length} pending wire approval(s) — Total: $${pendingTotal.toFixed(2)}`
+    : `${wires.length} wire approval(s):`
+
+  return {
+    output: [header, "", ...lines].join("\n"),
+    source: "on-device",
+  }
+}
+
+// ── PII Detection ────────────────────────────────────────────────────────
 
 function executeDetectPII(args: Record<string, unknown>): ToolExecutionResult {
   const text = (args.text as string) ?? ""
@@ -107,25 +258,21 @@ function executeDetectPII(args: Record<string, unknown>): ToolExecutionResult {
   }
 }
 
+// ── Redact & Analyze (Cloud with PII protection) ────────────────────────
+
 async function executeRedactAndAnalyze(args: Record<string, unknown>): Promise<ToolExecutionResult> {
   const text = (args.text as string) ?? ""
   const question = (args.question as string) ?? "Analyze this data."
 
-  // Step 1: Detect PII
   const entities = detectPII(text)
-
-  // Step 2: Redact
   const { redactedText } = redactText(text, entities)
 
-  // Step 3: Send redacted text + question to Gemini
-  const prompt = `The following data has been redacted for privacy. Analyze it and answer the question.\n\nRedacted data:\n${redactedText}\n\nQuestion: ${question}`
+  const prompt = `You are a financial compliance assistant. The following data has been redacted for privacy (PII replaced with placeholders). Analyze it and answer the question.\n\nRedacted data:\n${redactedText}\n\nQuestion: ${question}`
 
   try {
     const messages: Message[] = [{ role: "user", content: prompt }]
     const cloud = await generateCloud(messages, [])
-    const cloudResponse = cloud.functionCalls.length > 0
-      ? cloud.functionCalls.map((fc) => `${fc.name}(${JSON.stringify(fc.arguments)})`).join(", ")
-      : "Cloud analysis complete. The redacted data was sent securely."
+    const cloudResponse = cloud.response || "Cloud analysis complete. The redacted data was sent securely."
 
     return {
       output: cloudResponse,
@@ -143,27 +290,26 @@ async function executeRedactAndAnalyze(args: Record<string, unknown>): Promise<T
   }
 }
 
+// ── Cloud Analyze (no PII) ───────────────────────────────────────────────
+
 async function executeCloudAnalyze(args: Record<string, unknown>): Promise<ToolExecutionResult> {
   const question = (args.question as string) ?? ""
 
-  // Safety check: run PII detection on the question itself
   const entities = detectPII(question)
   const sensitivity = scoreSensitivity(question, entities)
 
   if (sensitivity === "HIGH") {
     return {
-      output: "This question contains sensitive data. Use redact_and_analyze instead to protect PII before sending to cloud.",
+      output: "⚠ This question contains sensitive data. Blocked from cloud. Use redact_and_analyze instead.",
       source: "on-device",
       piiDetected: entities.length,
     }
   }
 
   try {
-    const messages: Message[] = [{ role: "user", content: question }]
+    const messages: Message[] = [{ role: "user", content: `You are a financial advisor. ${question}` }]
     const cloud = await generateCloud(messages, [])
-    const cloudResponse = cloud.functionCalls.length > 0
-      ? cloud.functionCalls.map((fc) => `${fc.name}(${JSON.stringify(fc.arguments)})`).join(", ")
-      : "Cloud analysis complete."
+    const cloudResponse = cloud.response || "Cloud analysis complete."
 
     return {
       output: cloudResponse,
@@ -173,7 +319,7 @@ async function executeCloudAnalyze(args: Record<string, unknown>): Promise<ToolE
   } catch (error) {
     return {
       output: `Cloud analysis failed: ${error instanceof Error ? error.message : "Unknown error"}`,
-      source: "cloud",
+      source: "on-device",
     }
   }
 }
