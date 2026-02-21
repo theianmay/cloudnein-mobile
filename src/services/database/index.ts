@@ -25,6 +25,24 @@ function createTables(database: SQLiteDatabase) {
       category TEXT NOT NULL UNIQUE,
       monthly_limit REAL NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS revenue (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      date TEXT NOT NULL,
+      client TEXT NOT NULL,
+      segment TEXT NOT NULL,
+      amount REAL NOT NULL,
+      type TEXT NOT NULL DEFAULT 'recurring',
+      notes TEXT
+    );
+    CREATE TABLE IF NOT EXISTS wire_approvals (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      date TEXT NOT NULL,
+      vendor TEXT NOT NULL,
+      amount REAL NOT NULL,
+      requested_by TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      notes TEXT
+    );
   `)
 }
 
