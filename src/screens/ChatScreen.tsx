@@ -16,8 +16,17 @@ import { useAppTheme } from "@/theme/context"
 import type { ThemedStyle } from "@/theme/types"
 import { useSafeAreaInsetsStyle } from "@/utils/useSafeAreaInsetsStyle"
 
+import { seedDatabase } from "@/services/database/seed"
 import { generateHybrid, ALL_TOOLS, initGemini } from "@/services/cactus"
 import type { HybridResult, FunctionCall, Message, CactusCompletable } from "@/services/cactus"
+
+// ── Badge colors ───────────────────────────────────────────────────────────
+
+const SOURCE_BADGE_COLORS: Record<string, { bg: string; text: string; label: string }> = {
+  "on-device": { bg: "#16a34a", text: "#ffffff", label: "Local" },
+  cloud: { bg: "#2563eb", text: "#ffffff", label: "Cloud" },
+  "redacted-cloud": { bg: "#ea580c", text: "#ffffff", label: "Redacted \u2192 Cloud" },
+}
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -25,10 +34,13 @@ interface ChatMessage {
   id: string
   role: "user" | "assistant" | "system"
   text: string
-  source?: "on-device" | "cloud"
+  source?: "on-device" | "cloud" | "redacted-cloud"
   functionCalls?: FunctionCall[]
   totalTimeMs?: number
   confidence?: number
+  sensitivityLevel?: "LOW" | "MEDIUM" | "HIGH"
+  piiDetected?: number
+  redactedPreview?: string
 }
 
 // ── Screen ─────────────────────────────────────────────────────────────────
@@ -43,8 +55,19 @@ export const ChatScreen: FC = function ChatScreen() {
   const [inputText, setInputText] = useState("")
   const [isProcessing, setIsProcessing] = useState(false)
   const [geminiReady, setGeminiReady] = useState(false)
+  const [dbReady, setDbReady] = useState(false)
   const flatListRef = useRef<FlatList>(null)
   const inputRef = useRef<TextInput>(null)
+
+  // Initialize database on mount
+  useEffect(() => {
+    try {
+      seedDatabase()
+      setDbReady(true)
+    } catch (e) {
+      console.warn("Database init failed:", e)
+    }
+  }, [])
 
   // Download model on mount
   useEffect(() => {
@@ -53,7 +76,7 @@ export const ChatScreen: FC = function ChatScreen() {
     }
   }, [])
 
-  // Initialize Gemini — user must set their API key here
+  // Initialize Gemini
   useEffect(() => {
     const apiKey = process.env.EXPO_PUBLIC_GEMINI_API_KEY ?? ""
     if (apiKey) {
@@ -93,11 +116,14 @@ export const ChatScreen: FC = function ChatScreen() {
       const assistantMsg: ChatMessage = {
         id: (Date.now() + 1).toString(),
         role: "assistant",
-        text: formatResult(result),
+        text: result.toolExecutionResult || result.response || "No response.",
         source: result.source,
         functionCalls: result.functionCalls,
         totalTimeMs: result.totalTimeMs,
         confidence: result.confidence,
+        sensitivityLevel: result.sensitivityLevel,
+        piiDetected: result.piiDetected,
+        redactedPreview: result.redactedPreview,
       }
       addMessage(assistantMsg)
     } catch (error) {
@@ -113,6 +139,18 @@ export const ChatScreen: FC = function ChatScreen() {
 
   // ── Render helpers ───────────────────────────────────────────────────────
 
+  const renderSourceBadge = useCallback((source: string) => {
+    const badge = SOURCE_BADGE_COLORS[source] ?? SOURCE_BADGE_COLORS["on-device"]
+    return (
+      <View style={[$sourceBadge, { backgroundColor: badge.bg }]}>
+        <Text
+          style={[$sourceBadgeText, { color: badge.text }]}
+          text={badge.label}
+        />
+      </View>
+    )
+  }, [])
+
   const renderMessage = useCallback(
     ({ item }: { item: ChatMessage }) => {
       const isUser = item.role === "user"
@@ -124,24 +162,71 @@ export const ChatScreen: FC = function ChatScreen() {
             isUser ? $userBubble : isSystem ? $systemBubble : $assistantBubble,
           )}
         >
+          {/* Source badge for assistant messages */}
+          {!isUser && !isSystem && item.source && (
+            <View style={$badgeRow}>
+              {renderSourceBadge(item.source)}
+              {item.sensitivityLevel && (
+                <View
+                  style={[
+                    $sensitivityBadge,
+                    {
+                      backgroundColor:
+                        item.sensitivityLevel === "HIGH"
+                          ? "#dc2626"
+                          : item.sensitivityLevel === "MEDIUM"
+                            ? "#f59e0b"
+                            : "#22c55e",
+                    },
+                  ]}
+                >
+                  <Text
+                    style={$sensitivityBadgeText}
+                    text={item.sensitivityLevel}
+                  />
+                </View>
+              )}
+              {(item.piiDetected ?? 0) > 0 && (
+                <View style={$piiBadge}>
+                  <Text
+                    style={$piiBadgeText}
+                    text={`${item.piiDetected} PII`}
+                  />
+                </View>
+              )}
+            </View>
+          )}
+
           <Text
             style={themed(isUser ? $userText : isSystem ? $systemText : $assistantText)}
             text={item.text}
           />
+
+          {/* Redacted preview */}
+          {item.redactedPreview && (
+            <View style={themed($redactedPreviewContainer)}>
+              <Text style={themed($redactedPreviewLabel)} text="Sent to cloud (redacted):" />
+              <Text style={themed($redactedPreviewText)} text={item.redactedPreview} />
+            </View>
+          )}
+
+          {/* Metadata row */}
           {item.source && (
             <View style={themed($metaRow)}>
               <Text
                 style={themed($metaText)}
-                text={`${item.source} · ${item.totalTimeMs?.toFixed(0)}ms`}
+                text={`${item.totalTimeMs?.toFixed(0)}ms`}
               />
               {item.confidence !== undefined && (
                 <Text
                   style={themed($metaText)}
-                  text={` · conf: ${item.confidence.toFixed(2)}`}
+                  text={` \u00B7 conf: ${item.confidence.toFixed(2)}`}
                 />
               )}
             </View>
           )}
+
+          {/* Tool call chips */}
           {item.functionCalls && item.functionCalls.length > 0 && (
             <View style={themed($toolCallsContainer)}>
               {item.functionCalls.map((fc, i) => (
@@ -158,7 +243,7 @@ export const ChatScreen: FC = function ChatScreen() {
         </View>
       )
     },
-    [themed],
+    [themed, renderSourceBadge],
   )
 
   // ── Download state ───────────────────────────────────────────────────────
@@ -189,10 +274,10 @@ export const ChatScreen: FC = function ChatScreen() {
     <Screen preset="fixed" contentContainerStyle={themed($screen)} safeAreaEdges={["top"]}>
       {/* Header */}
       <View style={themed($header)}>
-        <Text preset="heading" style={themed($headerTitle)} text="Cactus Agent" />
+        <Text preset="heading" style={themed($headerTitle)} text="Sovereign Ledger" />
         <Text
           style={themed($headerSubtitle)}
-          text={`FunctionGemma (local) + Gemini Flash (cloud)${geminiReady ? "" : " · Gemini not configured"}`}
+          text={`FunctionGemma (local) + Gemini Flash (cloud)${geminiReady ? "" : " \u00B7 Gemini not configured"}${dbReady ? "" : " \u00B7 DB loading..."}`}
         />
       </View>
 
@@ -206,11 +291,16 @@ export const ChatScreen: FC = function ChatScreen() {
         style={themed($messageListContainer)}
         ListEmptyComponent={
           <View style={themed($emptyState)}>
-            <Text style={themed($emptyTitle)} text="Ask me anything" />
+            <Text style={themed($emptyTitle)} text="Sovereign Ledger" />
             <Text
               style={themed($emptySubtitle)}
-              text="I can call tools like weather, alarms, messages, reminders, music, timers, and contacts."
+              text="Your private financial assistant. Sensitive data never leaves your device raw."
             />
+            <View style={themed($emptyHints)}>
+              <Text style={themed($emptyHint)} text={'Try: "What was my total spend in February?"'} />
+              <Text style={themed($emptyHint)} text={'Try: "Am I over budget on marketing?"'} />
+              <Text style={themed($emptyHint)} text={'Try: "John Smith SSN 123-45-6789 approved $50K"'} />
+            </View>
           </View>
         }
       />
@@ -222,11 +312,12 @@ export const ChatScreen: FC = function ChatScreen() {
           style={themed($textInput)}
           value={inputText}
           onChangeText={setInputText}
-          placeholder="Type a message..."
+          placeholder="Ask about expenses, budgets, or paste sensitive text..."
           placeholderTextColor={theme.colors.textDim}
           editable={!isProcessing}
           onSubmitEditing={handleSend}
           returnKeyType="send"
+          multiline
         />
         <Pressable
           style={({ pressed }) => [
@@ -246,18 +337,6 @@ export const ChatScreen: FC = function ChatScreen() {
       </View>
     </Screen>
   )
-}
-
-// ── Helpers ──────────────────────────────────────────────────────────────────
-
-function formatResult(result: HybridResult): string {
-  if (result.functionCalls.length === 0) {
-    return result.response || "No tool calls generated."
-  }
-  const calls = result.functionCalls
-    .map((fc) => `${fc.name}(${JSON.stringify(fc.arguments)})`)
-    .join("\n")
-  return `Tool calls:\n${calls}`
 }
 
 // ── Styles ──────────────────────────────────────────────────────────────────
@@ -321,7 +400,7 @@ const $assistantBubble: ThemedStyle<ViewStyle> = ({ colors, spacing }) => ({
   paddingHorizontal: spacing.md,
   paddingVertical: spacing.sm,
   marginBottom: spacing.xs,
-  maxWidth: "85%",
+  maxWidth: "90%",
   borderWidth: 1,
   borderColor: colors.separator,
 })
@@ -343,12 +422,81 @@ const $userText: ThemedStyle<TextStyle> = ({ colors }) => ({
 
 const $assistantText: ThemedStyle<TextStyle> = ({ colors }) => ({
   color: colors.text,
-  fontSize: 15,
+  fontSize: 14,
+  lineHeight: 20,
 })
 
 const $systemText: ThemedStyle<TextStyle> = ({ colors }) => ({
   color: colors.error,
   fontSize: 13,
+})
+
+const $badgeRow: ViewStyle = {
+  flexDirection: "row",
+  gap: 6,
+  marginBottom: 6,
+  flexWrap: "wrap",
+}
+
+const $sourceBadge: ViewStyle = {
+  paddingHorizontal: 8,
+  paddingVertical: 2,
+  borderRadius: 10,
+}
+
+const $sourceBadgeText: TextStyle = {
+  fontSize: 10,
+  fontWeight: "700",
+  letterSpacing: 0.5,
+}
+
+const $sensitivityBadge: ViewStyle = {
+  paddingHorizontal: 6,
+  paddingVertical: 2,
+  borderRadius: 10,
+}
+
+const $sensitivityBadgeText: TextStyle = {
+  fontSize: 9,
+  fontWeight: "700",
+  color: "#ffffff",
+  letterSpacing: 0.5,
+}
+
+const $piiBadge: ViewStyle = {
+  paddingHorizontal: 6,
+  paddingVertical: 2,
+  borderRadius: 10,
+  backgroundColor: "#7c3aed",
+}
+
+const $piiBadgeText: TextStyle = {
+  fontSize: 9,
+  fontWeight: "700",
+  color: "#ffffff",
+  letterSpacing: 0.5,
+}
+
+const $redactedPreviewContainer: ThemedStyle<ViewStyle> = ({ colors, spacing }) => ({
+  marginTop: spacing.xs,
+  padding: spacing.xs,
+  backgroundColor: colors.palette.neutral200,
+  borderRadius: 8,
+  borderLeftWidth: 3,
+  borderLeftColor: "#ea580c",
+})
+
+const $redactedPreviewLabel: ThemedStyle<TextStyle> = () => ({
+  fontSize: 10,
+  fontWeight: "700",
+  color: "#ea580c",
+  marginBottom: 2,
+})
+
+const $redactedPreviewText: ThemedStyle<TextStyle> = ({ colors }) => ({
+  fontSize: 11,
+  color: colors.textDim,
+  fontStyle: "italic",
 })
 
 const $metaRow: ThemedStyle<ViewStyle> = ({ spacing }) => ({
@@ -386,7 +534,7 @@ const $toolCallArgs: ThemedStyle<TextStyle> = ({ colors }) => ({
 
 const $inputBar: ThemedStyle<ViewStyle> = ({ colors, spacing }) => ({
   flexDirection: "row",
-  alignItems: "center",
+  alignItems: "flex-end",
   paddingHorizontal: spacing.sm,
   paddingVertical: spacing.xs,
   borderTopWidth: 1,
@@ -397,9 +545,11 @@ const $inputBar: ThemedStyle<ViewStyle> = ({ colors, spacing }) => ({
 
 const $textInput: ThemedStyle<TextStyle> = ({ colors, typography, spacing }) => ({
   flex: 1,
-  height: 44,
+  minHeight: 44,
+  maxHeight: 100,
   borderRadius: 22,
   paddingHorizontal: spacing.md,
+  paddingVertical: spacing.sm,
   backgroundColor: colors.palette.neutral200,
   fontFamily: typography.primary.normal,
   fontSize: 15,
@@ -459,7 +609,8 @@ const $emptyState: ThemedStyle<ViewStyle> = ({ spacing }) => ({
 })
 
 const $emptyTitle: ThemedStyle<TextStyle> = ({ colors }) => ({
-  fontSize: 22,
+  fontSize: 24,
+  fontWeight: "700",
   color: colors.text,
   marginBottom: 8,
 })
@@ -469,4 +620,16 @@ const $emptySubtitle: ThemedStyle<TextStyle> = ({ colors }) => ({
   color: colors.textDim,
   textAlign: "center",
   paddingHorizontal: 32,
+  marginBottom: 24,
+})
+
+const $emptyHints: ThemedStyle<ViewStyle> = ({ spacing }) => ({
+  gap: spacing.xs,
+  alignItems: "center",
+})
+
+const $emptyHint: ThemedStyle<TextStyle> = ({ colors }) => ({
+  fontSize: 13,
+  color: colors.tint,
+  fontStyle: "italic",
 })

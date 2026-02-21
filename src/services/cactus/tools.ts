@@ -1,98 +1,99 @@
 import type { Tool } from "./types"
 
-export const TOOL_GET_WEATHER: Tool = {
-  name: "get_weather",
-  description: "Get current weather for a location",
+export const TOOL_QUERY_EXPENSES: Tool = {
+  name: "query_expenses",
+  description:
+    "Query expense records from the local financial database. Use this for questions about spending, costs, totals, transactions, purchases, or payments. Can filter by category, date range, or vendor name.",
   parameters: {
     type: "object",
     properties: {
-      location: { type: "string", description: "City name" },
+      category: {
+        type: "string",
+        description:
+          "Expense category to filter by (e.g. Engineering, Marketing, Payroll, Legal, Office, Travel, Meals, Software, Insurance)",
+      },
+      vendor: {
+        type: "string",
+        description: "Vendor or company name to search for",
+      },
     },
-    required: ["location"],
+    required: [],
   },
 }
 
-export const TOOL_SET_ALARM: Tool = {
-  name: "set_alarm",
-  description: "Set an alarm for a given time",
+export const TOOL_GET_BUDGET_STATUS: Tool = {
+  name: "get_budget_status",
+  description:
+    "Get budget status showing budget limit versus actual spending for a category or all categories. Use this for questions about budget, overspending, remaining balance, or whether we are over or under budget.",
   parameters: {
     type: "object",
     properties: {
-      hour: { type: "integer", description: "Hour to set the alarm for" },
-      minute: { type: "integer", description: "Minute to set the alarm for" },
+      category: {
+        type: "string",
+        description:
+          "Budget category to check (e.g. Engineering, Marketing, Payroll, Legal). Leave empty for all categories.",
+      },
     },
-    required: ["hour", "minute"],
+    required: [],
   },
 }
 
-export const TOOL_SEND_MESSAGE: Tool = {
-  name: "send_message",
-  description: "Send a message to a contact",
+export const TOOL_DETECT_PII: Tool = {
+  name: "detect_pii",
+  description:
+    "Detect personally identifiable information (PII) in text. Use when the user pastes or references text that may contain sensitive personal or financial data like names, SSNs, account numbers, emails, phone numbers, or credit card numbers.",
   parameters: {
     type: "object",
     properties: {
-      recipient: { type: "string", description: "Name of the person to send the message to" },
-      message: { type: "string", description: "The message content to send" },
+      text: {
+        type: "string",
+        description: "The text to scan for PII",
+      },
     },
-    required: ["recipient", "message"],
+    required: ["text"],
   },
 }
 
-export const TOOL_CREATE_REMINDER: Tool = {
-  name: "create_reminder",
-  description: "Create a reminder with a title and time",
+export const TOOL_REDACT_AND_ANALYZE: Tool = {
+  name: "redact_and_analyze",
+  description:
+    "Redact sensitive information from text and send the sanitized version to cloud AI for deep analysis, market comparison, trend analysis, or strategic advice. Use when the question requires complex reasoning AND the text contains sensitive data that must be protected.",
   parameters: {
     type: "object",
     properties: {
-      title: { type: "string", description: "Reminder title" },
-      time: { type: "string", description: "Time for the reminder (e.g. 3:00 PM)" },
+      text: {
+        type: "string",
+        description: "The text containing sensitive data to redact before cloud analysis",
+      },
+      question: {
+        type: "string",
+        description: "The analytical question to ask the cloud AI about the redacted data",
+      },
     },
-    required: ["title", "time"],
+    required: ["text", "question"],
   },
 }
 
-export const TOOL_SEARCH_CONTACTS: Tool = {
-  name: "search_contacts",
-  description: "Search for a contact by name",
+export const TOOL_CLOUD_ANALYZE: Tool = {
+  name: "cloud_analyze",
+  description:
+    "Send a question to cloud AI for complex analysis, comparisons, trend analysis, market insights, or strategic advice. Only use when the question requires deep reasoning and the text does NOT contain sensitive personal or financial information.",
   parameters: {
     type: "object",
     properties: {
-      query: { type: "string", description: "Name to search for" },
+      question: {
+        type: "string",
+        description: "The analytical question to send to cloud AI",
+      },
     },
-    required: ["query"],
-  },
-}
-
-export const TOOL_PLAY_MUSIC: Tool = {
-  name: "play_music",
-  description: "Play a song or playlist",
-  parameters: {
-    type: "object",
-    properties: {
-      song: { type: "string", description: "Song or playlist name" },
-    },
-    required: ["song"],
-  },
-}
-
-export const TOOL_SET_TIMER: Tool = {
-  name: "set_timer",
-  description: "Set a countdown timer",
-  parameters: {
-    type: "object",
-    properties: {
-      minutes: { type: "integer", description: "Number of minutes" },
-    },
-    required: ["minutes"],
+    required: ["question"],
   },
 }
 
 export const ALL_TOOLS: Tool[] = [
-  TOOL_GET_WEATHER,
-  TOOL_SET_ALARM,
-  TOOL_SEND_MESSAGE,
-  TOOL_CREATE_REMINDER,
-  TOOL_SEARCH_CONTACTS,
-  TOOL_PLAY_MUSIC,
-  TOOL_SET_TIMER,
+  TOOL_QUERY_EXPENSES,
+  TOOL_GET_BUDGET_STATUS,
+  TOOL_DETECT_PII,
+  TOOL_REDACT_AND_ANALYZE,
+  TOOL_CLOUD_ANALYZE,
 ]

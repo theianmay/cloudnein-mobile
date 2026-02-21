@@ -1,6 +1,10 @@
 import type { CactusLMCompleteParams, CactusLMCompleteResult } from "cactus-react-native"
 
+import { detectPII, scoreSensitivity, redactText } from "@/services/privacy"
+import type { SensitivityLevel } from "@/services/privacy"
+
 import { generateCloud } from "./geminiCloud"
+import { executeTool } from "./toolExecutor"
 import type {
   Tool,
   Message,
@@ -19,38 +23,6 @@ export interface CactusCompletable {
 }
 
 /**
- * Estimate query complexity to decide whether local inference is likely sufficient.
- * Returns true if the query should be handled locally.
- */
-function shouldTryLocal(
-  messages: Message[],
-  tools: Tool[],
-  config: HybridRouterConfig,
-): boolean {
-  const userMessage = messages.find((m) => m.role === "user")?.content ?? ""
-
-  // If too many tools, the small model may struggle to pick the right one
-  if (tools.length > config.maxToolsForLocal) {
-    return false
-  }
-
-  // If the message is very long/complex, prefer cloud
-  if (userMessage.length > config.maxMessageLengthForLocal) {
-    return false
-  }
-
-  // Count conjunctions that suggest multi-tool requests ("and", "then", "also")
-  const multiActionWords = /\b(and|then|also|plus|additionally)\b/gi
-  const matches = userMessage.match(multiActionWords)
-  if (matches && matches.length >= 2) {
-    // Likely a multi-tool request — harder for small models
-    return false
-  }
-
-  return true
-}
-
-/**
  * Run tool calling on-device via FunctionGemma + Cactus.
  */
 async function generateLocal(
@@ -60,12 +32,12 @@ async function generateLocal(
 ): Promise<{
   functionCalls: FunctionCall[]
   totalTimeMs: number
-  confidence: number
   response: string
 }> {
   const systemMessage: Message = {
     role: "system",
-    content: "You are a helpful assistant that can use tools.",
+    content:
+      "You are a privacy-aware financial assistant. You have access to a local expense database and can detect/redact PII. Choose the most appropriate tool for the user's request.",
   }
 
   const result = await cactusLM.complete({
@@ -87,34 +59,29 @@ async function generateLocal(
   return {
     functionCalls,
     totalTimeMs: result.totalTimeMs,
-    confidence: 0, // Will be estimated below
     response: result.response,
   }
 }
 
 /**
  * Estimate confidence from the local result.
- * Uses heuristics since the React Native SDK may not expose raw confidence scores.
  */
 function estimateConfidence(
   localResult: { functionCalls: FunctionCall[]; response: string },
   tools: Tool[],
 ): number {
-  // No function calls produced — low confidence
   if (localResult.functionCalls.length === 0) {
     return 0.1
   }
 
   let confidence = 0.7
 
-  // Check that all returned function names are valid tool names
   const toolNames = new Set(tools.map((t) => t.name))
   const allValid = localResult.functionCalls.every((fc) => toolNames.has(fc.name))
   if (!allValid) {
     return 0.15
   }
 
-  // Check that required arguments are present
   for (const fc of localResult.functionCalls) {
     const tool = tools.find((t) => t.name === fc.name)
     if (!tool) continue
@@ -125,7 +92,6 @@ function estimateConfidence(
     }
   }
 
-  // Bonus for single clean call
   if (localResult.functionCalls.length === 1) {
     confidence += 0.15
   }
@@ -134,8 +100,34 @@ function estimateConfidence(
 }
 
 /**
- * Hybrid inference: try local FunctionGemma first, fall back to Gemini cloud
- * based on confidence and complexity heuristics.
+ * Filter tools based on sensitivity level.
+ * HIGH: only allow redact_and_analyze (force redaction before cloud)
+ * MEDIUM: block cloud_analyze, allow everything else
+ * LOW: allow all tools
+ */
+function filterToolsBySensitivity(tools: Tool[], level: SensitivityLevel): Tool[] {
+  switch (level) {
+    case "HIGH":
+      return tools.filter((t) => t.name !== "cloud_analyze")
+    case "MEDIUM":
+      return tools.filter((t) => t.name !== "cloud_analyze")
+    case "LOW":
+    default:
+      return tools
+  }
+}
+
+/**
+ * Privacy-aware hybrid inference pipeline.
+ *
+ * 1. Always detect PII in user message first (instant, regex-based)
+ * 2. Score sensitivity (rule-based)
+ * 3. Route based on sensitivity:
+ *    - HIGH: force redact_and_analyze (skip FunctionGemma decision)
+ *    - MEDIUM: FunctionGemma picks tool, but cloud_analyze is blocked
+ *    - LOW: FunctionGemma picks from all tools
+ * 4. Execute the selected tool
+ * 5. Return result with full transparency metadata
  */
 export async function generateHybrid(
   cactusLM: CactusCompletable,
@@ -143,64 +135,90 @@ export async function generateHybrid(
   tools: Tool[],
   config: HybridRouterConfig = DEFAULT_HYBRID_CONFIG,
 ): Promise<HybridResult> {
-  const tryLocal = shouldTryLocal(messages, tools, config)
+  const startTime = Date.now()
+  const userMessage = messages.find((m) => m.role === "user")?.content ?? ""
 
-  if (!tryLocal) {
-    // Skip local entirely for complex queries
-    const startTime = Date.now()
+  // ── Step 1: PII Detection (always, instant) ──────────────────────────
+  const piiEntities = detectPII(userMessage)
+  const sensitivityLevel = scoreSensitivity(userMessage, piiEntities)
+
+  // ── Step 2: HIGH sensitivity → force redaction pipeline ──────────────
+  if (sensitivityLevel === "HIGH") {
+    const { redactedText } = redactText(userMessage, piiEntities)
+
+    const forceCall: FunctionCall = {
+      name: "redact_and_analyze",
+      arguments: { text: userMessage, question: userMessage },
+    }
+
+    const execResult = await executeTool(forceCall)
+
+    return {
+      source: "redacted-cloud",
+      functionCalls: [forceCall],
+      response: execResult.output,
+      totalTimeMs: Date.now() - startTime,
+      sensitivityLevel,
+      piiDetected: piiEntities.length,
+      redactedPreview: redactedText.slice(0, 200),
+      toolExecutionResult: execResult.output,
+    }
+  }
+
+  // ── Step 3: Filter tools by sensitivity ──────────────────────────────
+  const availableTools = filterToolsBySensitivity(tools, sensitivityLevel)
+
+  // ── Step 4: FunctionGemma picks a tool ───────────────────────────────
+  const local = await generateLocal(cactusLM, messages, availableTools)
+  const confidence = estimateConfidence(local, availableTools)
+
+  // ── Step 5: If confidence too low, fall back to cloud ────────────────
+  if (confidence < config.confidenceThreshold) {
     try {
-      const cloud = await generateCloud(messages, tools)
-      return {
-        source: "cloud",
-        functionCalls: cloud.functionCalls,
-        response: cloud.functionCalls.map((fc) => `${fc.name}(${JSON.stringify(fc.arguments)})`).join(", "),
-        totalTimeMs: cloud.totalTimeMs,
+      const cloud = await generateCloud(messages, availableTools)
+      if (cloud.functionCalls.length > 0) {
+        // Execute the cloud-selected tool
+        const execResult = await executeTool(cloud.functionCalls[0])
+        return {
+          source: execResult.source === "on-device" ? "on-device" : "cloud",
+          functionCalls: cloud.functionCalls,
+          response: execResult.output,
+          totalTimeMs: Date.now() - startTime,
+          localConfidence: confidence,
+          sensitivityLevel,
+          piiDetected: piiEntities.length,
+          toolExecutionResult: execResult.output,
+        }
       }
-    } catch (error) {
-      // Cloud failed — try local as last resort
-      const local = await generateLocal(cactusLM, messages, tools)
-      return {
-        source: "on-device",
-        functionCalls: local.functionCalls,
-        response: local.response,
-        totalTimeMs: local.totalTimeMs + (Date.now() - startTime),
-        confidence: estimateConfidence(local, tools),
-      }
+    } catch {
+      // Cloud failed — fall through to execute local result
     }
   }
 
-  // Try local first
-  const local = await generateLocal(cactusLM, messages, tools)
-  const confidence = estimateConfidence(local, tools)
-
-  if (confidence >= config.confidenceThreshold) {
+  // ── Step 6: Execute the locally-selected tool ────────────────────────
+  if (local.functionCalls.length > 0) {
+    const execResult = await executeTool(local.functionCalls[0])
     return {
-      source: "on-device",
+      source: execResult.source,
       functionCalls: local.functionCalls,
-      response: local.response,
-      totalTimeMs: local.totalTimeMs,
+      response: execResult.output,
+      totalTimeMs: Date.now() - startTime,
       confidence,
+      sensitivityLevel,
+      piiDetected: piiEntities.length,
+      redactedPreview: execResult.redactedPreview,
+      toolExecutionResult: execResult.output,
     }
   }
 
-  // Confidence too low — fall back to cloud
-  try {
-    const cloud = await generateCloud(messages, tools)
-    return {
-      source: "cloud",
-      functionCalls: cloud.functionCalls,
-      response: cloud.functionCalls.map((fc) => `${fc.name}(${JSON.stringify(fc.arguments)})`).join(", "),
-      totalTimeMs: local.totalTimeMs + cloud.totalTimeMs,
-      localConfidence: confidence,
-    }
-  } catch {
-    // Cloud failed — return local result anyway
-    return {
-      source: "on-device",
-      functionCalls: local.functionCalls,
-      response: local.response,
-      totalTimeMs: local.totalTimeMs,
-      confidence,
-    }
+  // ── Fallback: no tool selected ───────────────────────────────────────
+  return {
+    source: "on-device",
+    functionCalls: [],
+    response: local.response || "I couldn't determine which tool to use. Try rephrasing your question.",
+    totalTimeMs: Date.now() - startTime,
+    confidence,
+    sensitivityLevel,
+    piiDetected: piiEntities.length,
   }
 }

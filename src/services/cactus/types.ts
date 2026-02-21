@@ -8,25 +8,23 @@ export interface FunctionCall {
 }
 
 export interface HybridResult {
-  source: "on-device" | "cloud"
+  source: "on-device" | "cloud" | "redacted-cloud"
   functionCalls: FunctionCall[]
   response: string
   totalTimeMs: number
   confidence?: number
   localConfidence?: number
+  sensitivityLevel?: "LOW" | "MEDIUM" | "HIGH"
+  piiDetected?: number
+  redactedPreview?: string
+  toolExecutionResult?: string
 }
 
 export interface HybridRouterConfig {
   /** Confidence threshold below which we fall back to cloud */
   confidenceThreshold: number
-  /** Maximum number of tools before preferring cloud */
-  maxToolsForLocal: number
-  /** Maximum message complexity (character count) for local */
-  maxMessageLengthForLocal: number
 }
 
 export const DEFAULT_HYBRID_CONFIG: HybridRouterConfig = {
   confidenceThreshold: 0.5,
-  maxToolsForLocal: 3,
-  maxMessageLengthForLocal: 200,
 }
