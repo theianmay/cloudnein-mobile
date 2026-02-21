@@ -103,15 +103,31 @@ export const ChatScreen: FC = function ChatScreen() {
       text,
     }
     addMessage(userMsg)
+    console.log(`\n[cloudNein] ──── USER INPUT ────`)
+    console.log(`[cloudNein] "${text}"`)
 
     try {
       const llmMessages: Message[] = [{ role: "user", content: text }]
 
+      console.log(`[cloudNein] Calling generateHybrid with ${ALL_TOOLS.length} tools...`)
       const result: HybridResult = await generateHybrid(
         cactusLM as CactusCompletable,
         llmMessages,
         ALL_TOOLS,
       )
+
+      console.log(`[cloudNein] ──── RESULT ────`)
+      console.log(`[cloudNein] Source: ${result.source}`)
+      console.log(`[cloudNein] Sensitivity: ${result.sensitivityLevel}`)
+      console.log(`[cloudNein] PII detected: ${result.piiDetected ?? 0}`)
+      console.log(`[cloudNein] Confidence: ${result.confidence ?? "N/A"}`)
+      console.log(`[cloudNein] Time: ${result.totalTimeMs}ms`)
+      console.log(`[cloudNein] Function calls: ${JSON.stringify(result.functionCalls)}`)
+      if (result.redactedPreview) {
+        console.log(`[cloudNein] Redacted preview: ${result.redactedPreview}`)
+      }
+      console.log(`[cloudNein] Tool result: ${(result.toolExecutionResult || result.response || "No response.").slice(0, 500)}`)
+      console.log(`[cloudNein] ────────────────`)
 
       const assistantMsg: ChatMessage = {
         id: (Date.now() + 1).toString(),
@@ -127,10 +143,15 @@ export const ChatScreen: FC = function ChatScreen() {
       }
       addMessage(assistantMsg)
     } catch (error) {
+      const errMsg = error instanceof Error ? error.message : "Unknown error"
+      console.error(`[cloudNein] ERROR: ${errMsg}`)
+      if (error instanceof Error && error.stack) {
+        console.error(`[cloudNein] Stack: ${error.stack}`)
+      }
       addMessage({
         id: (Date.now() + 1).toString(),
         role: "system",
-        text: `Error: ${error instanceof Error ? error.message : "Unknown error"}`,
+        text: `Error: ${errMsg}`,
       })
     } finally {
       setIsProcessing(false)
