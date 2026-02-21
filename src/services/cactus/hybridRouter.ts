@@ -2,6 +2,14 @@ import type { CactusLMCompleteParams, CactusLMCompleteResult } from "cactus-reac
 
 import { detectPII, scoreSensitivity, redactText } from "@/services/privacy"
 import type { SensitivityLevel } from "@/services/privacy"
+import {
+  queryExpenses,
+  getBudgetStatus,
+  queryRevenue,
+  getWireApprovals,
+  getTotalSpend,
+  getTotalRevenue,
+} from "@/services/database/queries"
 
 import { generateCloud } from "./geminiCloud"
 import { executeTool } from "./toolExecutor"
@@ -11,6 +19,7 @@ import type {
   FunctionCall,
   HybridResult,
   HybridRouterConfig,
+  RoutingPath,
 } from "./types"
 import { DEFAULT_HYBRID_CONFIG } from "./types"
 
@@ -22,54 +31,66 @@ export interface CactusCompletable {
   complete(params: CactusLMCompleteParams): Promise<CactusLMCompleteResult>
 }
 
-/**
- * Keyword-based pre-router: narrows 7 tools down to 2-3 relevant ones
- * so FunctionGemma 270M doesn't get overwhelmed.
- */
-function preRouteTools(userMessage: string, tools: Tool[]): Tool[] {
+// ── Stage 0: Query Complexity Classifier ────────────────────────────────
+
+type QueryType = "data-lookup" | "analytical"
+
+function classifyQuery(msg: string): { type: QueryType; reason: string } {
+  const lower = msg.toLowerCase()
+
+  // Analytical patterns: questions that need reasoning, not just data
+  if (/should\s+(we|i)|recommend|advice|suggest|optimize|strategy/.test(lower)) {
+    return { type: "analytical", reason: "advisory/strategic question" }
+  }
+  if (/why\s+(is|are|did|do|was)|explain|reason|cause/.test(lower)) {
+    return { type: "analytical", reason: "causal reasoning question" }
+  }
+  if (/compare|versus|vs\.?|better|worse|difference/.test(lower)) {
+    return { type: "analytical", reason: "comparison question" }
+  }
+  if (/trend|forecast|predict|project|next\s+(month|quarter|year)/.test(lower)) {
+    return { type: "analytical", reason: "trend/forecast question" }
+  }
+  if (/cut|reduce|increase|grow|improve|risk|opportunity/.test(lower)) {
+    return { type: "analytical", reason: "action/optimization question" }
+  }
+  if (/summary|summarize|overview|report|insight/.test(lower)) {
+    return { type: "analytical", reason: "summary/insight request" }
+  }
+
+  return { type: "data-lookup", reason: "data retrieval question" }
+}
+
+// ── Stage 1: Context Narrowing (pre-router) ─────────────────────────────
+
+function narrowTools(userMessage: string, tools: Tool[]): Tool[] {
   const msg = userMessage.toLowerCase()
   const toolMap = new Map(tools.map((t) => [t.name, t]))
 
   const pick = (names: string[]): Tool[] =>
     names.map((n) => toolMap.get(n)).filter((t): t is Tool => t !== undefined)
 
-  // Budget keywords
   if (/budget|over\s?budget|under\s?budget|remaining|limit/.test(msg)) {
     return pick(["get_budget_status", "query_expenses"])
   }
-
-  // Wire / approval keywords
   if (/wire|approv|pending|transfer|authorize/.test(msg)) {
     return pick(["get_wire_approvals", "query_expenses"])
   }
-
-  // Revenue keywords
   if (/revenue|income|sales|client|segment|arr|mrr|enterprise|mid.market|smb/.test(msg)) {
     return pick(["query_revenue", "query_expenses"])
   }
-
-  // Expense / spend / vendor / pay keywords
   if (/spend|expense|cost|pay|paid|vendor|total|how much/.test(msg)) {
     return pick(["query_expenses", "get_budget_status"])
   }
-
-  // PII / sensitive data keywords (handled by sensitivity router, but just in case)
   if (/ssn|social security|credit card|account number|redact/.test(msg)) {
     return pick(["detect_pii", "redact_and_analyze"])
   }
 
-  // Cloud / analyze / advice keywords
-  if (/analyze|advice|compare|trend|benchmark|strategy/.test(msg)) {
-    return pick(["cloud_analyze", "query_expenses"])
-  }
-
-  // Default: give the 4 most common local tools
   return pick(["query_expenses", "get_budget_status", "query_revenue", "get_wire_approvals"])
 }
 
-/**
- * Run tool calling on-device via FunctionGemma + Cactus.
- */
+// ── Stage 2: FunctionGemma On-Device Tool Calling ───────────────────────
+
 async function generateLocal(
   cactusLM: CactusCompletable,
   messages: Message[],
@@ -113,9 +134,8 @@ async function generateLocal(
   }
 }
 
-/**
- * Resolve fuzzy tool names for confidence checking too.
- */
+// ── Fuzzy Tool Name Matching ────────────────────────────────────────────
+
 const TOOL_ALIASES: Record<string, string> = {
   get_wire_approval: "get_wire_approvals",
   wire_approvals: "get_wire_approvals",
@@ -127,55 +147,41 @@ const TOOL_ALIASES: Record<string, string> = {
   cloud: "cloud_analyze",
 }
 
-/**
- * Estimate confidence from the local result.
- */
+// ── Confidence Estimation ───────────────────────────────────────────────
+
 function estimateConfidence(
   localResult: { functionCalls: FunctionCall[]; response: string },
   tools: Tool[],
 ): number {
-  if (localResult.functionCalls.length === 0) {
-    return 0.1
-  }
+  if (localResult.functionCalls.length === 0) return 0.1
 
   let confidence = 0.7
-
   const toolNames = new Set(tools.map((t) => t.name))
+
   const allValid = localResult.functionCalls.every((fc) => {
     const resolved = TOOL_ALIASES[fc.name] ?? fc.name
     return toolNames.has(fc.name) || toolNames.has(resolved)
   })
-  if (!allValid) {
-    return 0.15
-  }
+  if (!allValid) return 0.15
 
   for (const fc of localResult.functionCalls) {
     const resolved = TOOL_ALIASES[fc.name] ?? fc.name
     const tool = tools.find((t) => t.name === fc.name || t.name === resolved)
     if (!tool) continue
     const required = tool.parameters.required ?? []
-    const hasAll = required.every((key) => key in fc.arguments)
-    if (!hasAll) {
-      confidence -= 0.3
-    }
+    if (!required.every((key) => key in fc.arguments)) confidence -= 0.3
   }
 
-  if (localResult.functionCalls.length === 1) {
-    confidence += 0.15
-  }
-
+  if (localResult.functionCalls.length === 1) confidence += 0.15
   return Math.max(0, Math.min(1, confidence))
 }
 
-/**
- * Keyword-based fallback: when FunctionGemma fails to produce a tool call,
- * try to extract intent from the user message and call the right tool directly.
- */
+// ── Keyword Fallback (when FunctionGemma produces no tool call) ─────────
+
 function fallbackToolCall(userMessage: string, tools: Tool[]): FunctionCall | null {
   const msg = userMessage.toLowerCase()
   const toolNames = new Set(tools.map((t) => t.name))
 
-  // "how much did we pay [vendor]" → query_expenses with vendor
   const payMatch = msg.match(/(?:pay|paid|spend|spent)\s+(?:on\s+|to\s+|with\s+|for\s+)?(.+?)(?:\?|$|\.|last|this)/)
   if (payMatch && toolNames.has("query_expenses")) {
     const vendor = payMatch[1].trim().replace(/[?"]/g, "")
@@ -185,7 +191,6 @@ function fallbackToolCall(userMessage: string, tools: Tool[]): FunctionCall | nu
     }
   }
 
-  // "show [category] expenses" → query_expenses with category
   const catMatch = msg.match(/(?:show|list|get)\s+(?:me\s+)?(?:all\s+)?(\w+)\s+expense/)
   if (catMatch && toolNames.has("query_expenses")) {
     const category = catMatch[1].charAt(0).toUpperCase() + catMatch[1].slice(1)
@@ -196,36 +201,85 @@ function fallbackToolCall(userMessage: string, tools: Tool[]): FunctionCall | nu
   return null
 }
 
-/**
- * Filter tools based on sensitivity level.
- * HIGH: only allow redact_and_analyze (force redaction before cloud)
- * MEDIUM: block cloud_analyze, allow everything else
- * LOW: allow all tools
- */
+// ── Sensitivity Filter ──────────────────────────────────────────────────
+
 function filterToolsBySensitivity(tools: Tool[], level: SensitivityLevel): Tool[] {
-  switch (level) {
-    case "HIGH":
-      return tools.filter((t) => t.name !== "cloud_analyze")
-    case "MEDIUM":
-      return tools.filter((t) => t.name !== "cloud_analyze")
-    case "LOW":
-    default:
-      return tools
+  if (level === "HIGH" || level === "MEDIUM") {
+    return tools.filter((t) => t.name !== "cloud_analyze")
   }
+  return tools
 }
 
-/**
- * Privacy-aware hybrid inference pipeline.
- *
- * 1. Always detect PII in user message first (instant, regex-based)
- * 2. Score sensitivity (rule-based)
- * 3. Route based on sensitivity:
- *    - HIGH: force redact_and_analyze (skip FunctionGemma decision)
- *    - MEDIUM: FunctionGemma picks tool, but cloud_analyze is blocked
- *    - LOW: FunctionGemma picks from all tools
- * 4. Execute the selected tool
- * 5. Return result with full transparency metadata
- */
+// ── Local Context Gathering (for analytical cloud path) ─────────────────
+
+function gatherLocalContext(userMessage: string): string {
+  const msg = userMessage.toLowerCase()
+  const parts: string[] = []
+
+  try {
+    // Always include budget status — most useful for strategic questions
+    const budgets = getBudgetStatus()
+    if (budgets.length > 0) {
+      const budgetLines = budgets.map((s) => {
+        const pct = ((s.total_spent / s.monthly_limit) * 100).toFixed(0)
+        return `${s.category}: $${s.total_spent.toFixed(0)} / $${s.monthly_limit.toFixed(0)} (${pct}%)`
+      })
+      parts.push(`BUDGET STATUS:\n${budgetLines.join("\n")}`)
+    }
+
+    // Include relevant expense data
+    if (/marketing|spend|expense|cost|cut|reduce|burn/.test(msg)) {
+      const totalSpend = getTotalSpend()
+      parts.push(`TOTAL EXPENSES (all time): $${totalSpend.toFixed(0)}`)
+    }
+
+    // Include revenue if relevant
+    if (/revenue|income|growth|cash|runway|burn|profit/.test(msg)) {
+      const totalRev = getTotalRevenue()
+      parts.push(`TOTAL REVENUE (all time): $${totalRev.toFixed(0)}`)
+
+      const recentRev = queryRevenue({})
+      if (recentRev.length > 0) {
+        const topClients = recentRev.slice(0, 5).map(
+          (r) => `${r.client} (${r.segment}): $${r.amount.toFixed(0)} - ${r.type}`,
+        )
+        parts.push(`RECENT REVENUE:\n${topClients.join("\n")}`)
+      }
+    }
+
+    // Include wire approvals if relevant
+    if (/approv|wire|pending|cash|runway/.test(msg)) {
+      const pending = getWireApprovals("pending")
+      if (pending.length > 0) {
+        const pendingTotal = pending.reduce((s, w) => s + w.amount, 0)
+        parts.push(`PENDING WIRE APPROVALS: ${pending.length} totaling $${pendingTotal.toFixed(0)}`)
+      }
+    }
+  } catch (e) {
+    console.warn("[cloudNein:context] Error gathering local context:", e)
+  }
+
+  return parts.join("\n\n")
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// MAIN PIPELINE: generateHybrid
+//
+// 5-stage pipeline:
+//   Stage 0: PII detection + sensitivity scoring (instant, always)
+//   Stage 1: Complexity classification (data-lookup vs analytical)
+//   Stage 2: Context narrowing (keyword pre-router, narrows 7→2-3 tools)
+//   Stage 3: FunctionGemma tool calling (on-device, ~3s)
+//   Stage 4: Execution (local SQL) or Cloud reasoning (Gemini)
+//
+// Routing paths:
+//   privacy-redact   → PII found → redact → cloud analysis
+//   cloud-analysis   → Analytical question → gather local data → Gemini reasons
+//   local-tool       → FunctionGemma picks tool → execute locally
+//   cloud-tool       → FunctionGemma fails → Gemini picks tool → execute locally
+//   local-fallback   → All models fail → keyword extraction → execute locally
+// ══════════════════════════════════════════════════════════════════════════
+
 export async function generateHybrid(
   cactusLM: CactusCompletable,
   messages: Message[],
@@ -235,23 +289,25 @@ export async function generateHybrid(
   const startTime = Date.now()
   const userMessage = messages.find((m) => m.role === "user")?.content ?? ""
 
-  // ── Step 1: PII Detection (always, instant) ──────────────────────────
+  // ── Stage 0: PII Detection (always, instant, <1ms) ───────────────────
   const piiEntities = detectPII(userMessage)
   const sensitivityLevel = scoreSensitivity(userMessage, piiEntities)
+  console.log(`[cloudNein:pipeline] Stage 0 — PII: ${piiEntities.length}, Sensitivity: ${sensitivityLevel}`)
 
-  // ── Step 2: HIGH sensitivity → force redaction pipeline ──────────────
+  // ── Privacy path: HIGH sensitivity → force redaction ──────────────────
   if (sensitivityLevel === "HIGH") {
+    console.log(`[cloudNein:pipeline] → PRIVACY-REDACT path (${piiEntities.length} PII entities)`)
     const { redactedText } = redactText(userMessage, piiEntities)
-
     const forceCall: FunctionCall = {
       name: "redact_and_analyze",
       arguments: { text: userMessage, question: userMessage },
     }
-
     const execResult = await executeTool(forceCall)
 
     return {
       source: "redacted-cloud",
+      routingPath: "privacy-redact",
+      routingReason: `${piiEntities.length} PII entities detected → auto-redacted before cloud`,
       functionCalls: [forceCall],
       response: execResult.output,
       totalTimeMs: Date.now() - startTime,
@@ -262,43 +318,61 @@ export async function generateHybrid(
     }
   }
 
-  // ── Step 3: Filter tools by sensitivity, then pre-route by keywords ──
-  const sensitivityFiltered = filterToolsBySensitivity(tools, sensitivityLevel)
-  const availableTools = preRouteTools(userMessage, sensitivityFiltered)
-  console.log(`[cloudNein:router] Sensitivity: ${sensitivityLevel}, PII: ${piiEntities.length}, Tools: [${availableTools.map((t) => t.name).join(", ")}]`)
+  // ── Stage 1: Complexity Classification ────────────────────────────────
+  const classification = classifyQuery(userMessage)
+  console.log(`[cloudNein:pipeline] Stage 1 — Type: ${classification.type}, Reason: ${classification.reason}`)
 
-  // ── Step 4: FunctionGemma picks a tool ───────────────────────────────
-  const local = await generateLocal(cactusLM, messages, availableTools)
-  const confidence = estimateConfidence(local, availableTools)
+  // ── Analytical path: gather local data → send to Gemini for reasoning ─
+  if (classification.type === "analytical") {
+    console.log(`[cloudNein:pipeline] → CLOUD-ANALYSIS path`)
+    const localContext = gatherLocalContext(userMessage)
+    console.log(`[cloudNein:pipeline] Local context (${localContext.length} chars): ${localContext.slice(0, 200)}...`)
 
-  // ── Step 5: If confidence too low, fall back to cloud ────────────────
-  if (confidence < config.confidenceThreshold) {
+    const prompt = `You are a CFO's financial advisor. Answer the question using ONLY the financial data provided below. Be specific with numbers.\n\n=== COMPANY FINANCIAL DATA ===\n${localContext}\n\n=== QUESTION ===\n${userMessage}`
+
     try {
-      const cloud = await generateCloud(messages, availableTools)
-      if (cloud.functionCalls.length > 0) {
-        // Execute the cloud-selected tool
-        const execResult = await executeTool(cloud.functionCalls[0])
-        return {
-          source: execResult.source === "on-device" ? "on-device" : "cloud",
-          functionCalls: cloud.functionCalls,
-          response: execResult.output,
-          totalTimeMs: Date.now() - startTime,
-          localConfidence: confidence,
-          sensitivityLevel,
-          piiDetected: piiEntities.length,
-          toolExecutionResult: execResult.output,
-        }
+      const cloud = await generateCloud(
+        [{ role: "user", content: prompt }],
+        [],
+      )
+
+      return {
+        source: "cloud",
+        routingPath: "cloud-analysis",
+        routingReason: `${classification.reason} → local data gathered → Gemini reasoning`,
+        functionCalls: [],
+        response: cloud.response || "Cloud analysis complete.",
+        totalTimeMs: Date.now() - startTime,
+        sensitivityLevel,
+        piiDetected: piiEntities.length,
+        toolExecutionResult: cloud.response || "Cloud analysis complete.",
+        localContext: localContext.slice(0, 300),
       }
-    } catch {
-      // Cloud failed — fall through to execute local result
+    } catch (error) {
+      console.warn(`[cloudNein:pipeline] Cloud analysis failed, falling through to tool path:`, error)
+      // Fall through to tool-calling path if cloud fails
     }
   }
 
-  // ── Step 6: Execute the locally-selected tool ────────────────────────
-  if (local.functionCalls.length > 0) {
+  // ── Stage 2: Context Narrowing (keyword pre-router) ───────────────────
+  const sensitivityFiltered = filterToolsBySensitivity(tools, sensitivityLevel)
+  const availableTools = narrowTools(userMessage, sensitivityFiltered)
+  console.log(`[cloudNein:pipeline] Stage 2 — Narrowed to ${availableTools.length} tools: [${availableTools.map((t) => t.name).join(", ")}]`)
+
+  // ── Stage 3: FunctionGemma Tool Calling (on-device, ~3s) ──────────────
+  console.log(`[cloudNein:pipeline] Stage 3 — FunctionGemma tool calling...`)
+  const local = await generateLocal(cactusLM, messages, availableTools)
+  const confidence = estimateConfidence(local, availableTools)
+  console.log(`[cloudNein:pipeline] FunctionGemma confidence: ${confidence.toFixed(2)}`)
+
+  // ── Stage 4a: High confidence → execute locally ───────────────────────
+  if (confidence >= config.confidenceThreshold && local.functionCalls.length > 0) {
+    console.log(`[cloudNein:pipeline] → LOCAL-TOOL path (confidence ${confidence.toFixed(2)} ≥ ${config.confidenceThreshold})`)
     const execResult = await executeTool(local.functionCalls[0])
     return {
-      source: execResult.source,
+      source: "on-device",
+      routingPath: "local-tool",
+      routingReason: `FunctionGemma selected ${local.functionCalls[0].name} (confidence ${confidence.toFixed(2)})`,
       functionCalls: local.functionCalls,
       response: execResult.output,
       totalTimeMs: Date.now() - startTime,
@@ -310,13 +384,40 @@ export async function generateHybrid(
     }
   }
 
-  // ── Fallback: keyword-based intent extraction ──────────────────────
+  // ── Stage 4b: Low confidence → Gemini picks tool → execute locally ────
+  if (confidence < config.confidenceThreshold) {
+    console.log(`[cloudNein:pipeline] → CLOUD-TOOL path (confidence ${confidence.toFixed(2)} < ${config.confidenceThreshold})`)
+    try {
+      const cloud = await generateCloud(messages, availableTools)
+      if (cloud.functionCalls.length > 0) {
+        const execResult = await executeTool(cloud.functionCalls[0])
+        return {
+          source: "on-device",
+          routingPath: "cloud-tool",
+          routingReason: `FunctionGemma uncertain (${confidence.toFixed(2)}) → Gemini selected ${cloud.functionCalls[0].name}`,
+          functionCalls: cloud.functionCalls,
+          response: execResult.output,
+          totalTimeMs: Date.now() - startTime,
+          localConfidence: confidence,
+          sensitivityLevel,
+          piiDetected: piiEntities.length,
+          toolExecutionResult: execResult.output,
+        }
+      }
+    } catch {
+      console.warn(`[cloudNein:pipeline] Cloud tool selection failed, trying fallback`)
+    }
+  }
+
+  // ── Stage 4c: All models failed → keyword extraction fallback ─────────
   const fallback = fallbackToolCall(userMessage, availableTools)
   if (fallback) {
-    console.log(`[cloudNein:fallback] Using keyword fallback: ${fallback.name}(${JSON.stringify(fallback.arguments)})`)
+    console.log(`[cloudNein:pipeline] → LOCAL-FALLBACK path: ${fallback.name}(${JSON.stringify(fallback.arguments)})`)
     const execResult = await executeTool(fallback)
     return {
-      source: execResult.source,
+      source: "on-device",
+      routingPath: "local-fallback",
+      routingReason: `Models failed → keyword extraction: ${fallback.name}`,
       functionCalls: [fallback],
       response: execResult.output,
       totalTimeMs: Date.now() - startTime,
@@ -328,9 +429,11 @@ export async function generateHybrid(
     }
   }
 
-  // ── Final fallback: no tool selected ──────────────────────────────
+  // ── Final: nothing worked ─────────────────────────────────────────────
   return {
     source: "on-device",
+    routingPath: "local-fallback",
+    routingReason: "No tool matched — try rephrasing",
     functionCalls: [],
     response: local.response || "I couldn't determine which tool to use. Try rephrasing your question.",
     totalTimeMs: Date.now() - startTime,

@@ -35,6 +35,8 @@ interface ChatMessage {
   role: "user" | "assistant" | "system"
   text: string
   source?: "on-device" | "cloud" | "redacted-cloud"
+  routingPath?: string
+  routingReason?: string
   functionCalls?: FunctionCall[]
   totalTimeMs?: number
   confidence?: number
@@ -117,6 +119,7 @@ export const ChatScreen: FC = function ChatScreen() {
       )
 
       console.log(`[cloudNein] ──── RESULT ────`)
+      console.log(`[cloudNein] Routing: ${result.routingPath} — ${result.routingReason}`)
       console.log(`[cloudNein] Source: ${result.source}`)
       console.log(`[cloudNein] Sensitivity: ${result.sensitivityLevel}`)
       console.log(`[cloudNein] PII detected: ${result.piiDetected ?? 0}`)
@@ -126,6 +129,9 @@ export const ChatScreen: FC = function ChatScreen() {
       if (result.redactedPreview) {
         console.log(`[cloudNein] Redacted preview: ${result.redactedPreview}`)
       }
+      if (result.localContext) {
+        console.log(`[cloudNein] Local context sent to cloud: ${result.localContext.slice(0, 200)}`)
+      }
       console.log(`[cloudNein] Tool result: ${(result.toolExecutionResult || result.response || "No response.").slice(0, 500)}`)
       console.log(`[cloudNein] ────────────────`)
 
@@ -134,6 +140,8 @@ export const ChatScreen: FC = function ChatScreen() {
         role: "assistant",
         text: result.toolExecutionResult || result.response || "No response.",
         source: result.source,
+        routingPath: result.routingPath,
+        routingReason: result.routingReason,
         functionCalls: result.functionCalls,
         totalTimeMs: result.totalTimeMs,
         confidence: result.confidence,
@@ -231,6 +239,14 @@ export const ChatScreen: FC = function ChatScreen() {
             </View>
           )}
 
+          {/* Routing reason */}
+          {item.routingReason && (
+            <Text
+              style={themed($routingReasonText)}
+              text={`⟶ ${item.routingReason}`}
+            />
+          )}
+
           {/* Metadata row */}
           {item.source && (
             <View style={themed($metaRow)}>
@@ -241,7 +257,13 @@ export const ChatScreen: FC = function ChatScreen() {
               {item.confidence !== undefined && (
                 <Text
                   style={themed($metaText)}
-                  text={` \u00B7 conf: ${item.confidence.toFixed(2)}`}
+                  text={` · conf: ${item.confidence.toFixed(2)}`}
+                />
+              )}
+              {item.routingPath && (
+                <Text
+                  style={themed($metaText)}
+                  text={` · ${item.routingPath}`}
                 />
               )}
             </View>
@@ -530,6 +552,13 @@ const $metaRow: ThemedStyle<ViewStyle> = ({ spacing }) => ({
 const $metaText: ThemedStyle<TextStyle> = ({ colors }) => ({
   fontSize: 11,
   color: colors.textDim,
+})
+
+const $routingReasonText: ThemedStyle<TextStyle> = ({ colors, spacing }) => ({
+  fontSize: 11,
+  fontStyle: "italic",
+  color: colors.textDim,
+  marginTop: spacing.xxs,
 })
 
 const $toolCallsContainer: ThemedStyle<ViewStyle> = ({ spacing }) => ({

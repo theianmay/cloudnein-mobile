@@ -7,8 +7,17 @@ export interface FunctionCall {
   arguments: Record<string, unknown>
 }
 
+export type RoutingPath =
+  | "local-tool"         // FunctionGemma picked tool → local SQL execution
+  | "cloud-tool"         // FunctionGemma failed → Gemini picked tool → local SQL execution
+  | "cloud-analysis"     // Analytical query → local data gathered → Gemini reasoning
+  | "privacy-redact"     // PII detected → redact → cloud analysis
+  | "local-fallback"     // Keyword extraction fallback → local SQL execution
+
 export interface HybridResult {
   source: "on-device" | "cloud" | "redacted-cloud"
+  routingPath: RoutingPath
+  routingReason: string
   functionCalls: FunctionCall[]
   response: string
   totalTimeMs: number
@@ -18,6 +27,7 @@ export interface HybridResult {
   piiDetected?: number
   redactedPreview?: string
   toolExecutionResult?: string
+  localContext?: string
 }
 
 export interface HybridRouterConfig {
