@@ -367,27 +367,65 @@ export async function generateHybrid(
   const sensitivityLevel = scoreSensitivity(userMessage, piiEntities)
   console.log(`[cloudNein:pipeline] Stage 0 — PII: ${piiEntities.length}, Sensitivity: ${sensitivityLevel}`)
 
-  // ── Privacy path: HIGH sensitivity → force redaction ──────────────────
+  // ── Privacy path: HIGH sensitivity → reversible subgraph redaction → cloud reasoning
   if (sensitivityLevel === "HIGH") {
     console.log(`[cloudNein:pipeline] → PRIVACY-REDACT path (${piiEntities.length} PII entities)`)
-    const { redactedText } = redactText(userMessage, piiEntities)
-    const forceCall: FunctionCall = {
-      name: "redact_and_analyze",
-      arguments: { text: userMessage, question: userMessage },
-    }
-    const execResult = await executeTool(forceCall)
 
-    return {
-      source: "redacted-cloud",
-      routingPath: "privacy-redact",
-      routingReason: `${piiEntities.length} PII entities detected → auto-redacted before cloud`,
-      functionCalls: [forceCall],
-      response: execResult.output,
-      totalTimeMs: Date.now() - startTime,
-      sensitivityLevel,
-      piiDetected: piiEntities.length,
-      redactedPreview: redactedText.slice(0, 200),
-      toolExecutionResult: execResult.output,
+    // Step A: Gather local financial data + build NodeMap (same as cloud-analysis)
+    const { context: rawContext, nodeMap } = gatherLocalContext(userMessage)
+
+    // Step B: Redact PII in user's question using NodeMap (Person_A, SSN_A, etc.)
+    const { redactedText: redactedQuestion } = redactText(userMessage, piiEntities, nodeMap)
+
+    // Step C: Anonymize the financial context using the same NodeMap
+    const anonymizedContext = anonymizeWithMap(rawContext, nodeMap)
+
+    console.log(`[cloudNein:subgraph] Privacy-redact NodeMap: ${nodeMap.toNode.size} entities`)
+    console.log(`[cloudNein:subgraph] Redacted question: "${redactedQuestion}"`)
+    console.log(`[cloudNein:subgraph] Anonymized context (${anonymizedContext.length} chars)`)
+
+    // Step D: Send redacted question + anonymized context to Gemini for real reasoning
+    const prompt = `You are a CFO's financial compliance assistant. The data below has been anonymized for privacy — real names replaced with aliases like Person_A, Vendor_B, etc.\n\nAnalyze the request in context of the company's financial data. Consider:\n- Is this approval within budget limits?\n- Does the vendor have a good payment history?\n- Are there any compliance concerns?\n- What is your recommendation?\n\n=== COMPANY FINANCIAL DATA ===\n${anonymizedContext}\n\n=== REQUEST ===\n${redactedQuestion}`
+
+    try {
+      const cloud = await generateCloud(
+        [{ role: "user", content: prompt }],
+        [],
+      )
+
+      // Step E: De-anonymize the response locally — swap node aliases back to real names
+      const rawCloudResponse = cloud.response || "Cloud analysis complete."
+      const deAnonymizedResponse = deAnonymize(rawCloudResponse, nodeMap)
+
+      console.log(`[cloudNein:subgraph] Cloud response (anonymized): ${rawCloudResponse.slice(0, 200)}...`)
+      console.log(`[cloudNein:subgraph] De-anonymized response: ${deAnonymizedResponse.slice(0, 200)}...`)
+
+      return {
+        source: "redacted-cloud",
+        routingPath: "privacy-redact",
+        routingReason: `${piiEntities.length} PII entities → ${nodeMap.toNode.size} entities anonymized → Gemini compliance analysis → de-anonymized locally`,
+        functionCalls: [{ name: "redact_and_analyze", arguments: { text: "[REDACTED]", question: redactedQuestion } }],
+        response: deAnonymizedResponse,
+        totalTimeMs: Date.now() - startTime,
+        sensitivityLevel,
+        piiDetected: piiEntities.length,
+        redactedPreview: redactedQuestion.slice(0, 200),
+        toolExecutionResult: deAnonymizedResponse,
+        localContext: anonymizedContext.slice(0, 300),
+      }
+    } catch (error) {
+      console.warn(`[cloudNein:pipeline] Privacy-redact cloud failed:`, error)
+      return {
+        source: "on-device",
+        routingPath: "privacy-redact",
+        routingReason: `${piiEntities.length} PII entities redacted locally (cloud unavailable)`,
+        functionCalls: [],
+        response: `Detected ${piiEntities.length} PII entities and redacted them locally. Cloud analysis unavailable.\n\nRedacted: ${redactedQuestion}`,
+        totalTimeMs: Date.now() - startTime,
+        sensitivityLevel,
+        piiDetected: piiEntities.length,
+        redactedPreview: redactedQuestion.slice(0, 200),
+      }
     }
   }
 
