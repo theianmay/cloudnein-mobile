@@ -63,19 +63,40 @@ export async function generateCloud(
   }
 
   const hasTools = tools.length > 0
-  const model = geminiClient.getGenerativeModel({
-    model: "gemini-2.0-flash",
-    ...(hasTools ? { tools: convertToolsToGemini(tools) } : {}),
-  })
-
   const contents = messages
     .filter((m) => m.role === "user")
     .map((m) => m.content ?? "")
     .join("\n")
 
-  const startTime = Date.now()
-  const result = await model.generateContent(contents)
-  const totalTimeMs = Date.now() - startTime
+  // Try multiple models in case one hits quota
+  const modelCandidates = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
+  let lastError: unknown = null
+
+  for (const modelName of modelCandidates) {
+    const model = geminiClient.getGenerativeModel({
+      model: modelName,
+      ...(hasTools ? { tools: convertToolsToGemini(tools) } : {}),
+    })
+
+    try {
+      const startTime = Date.now()
+      const result = await model.generateContent(contents)
+      const totalTimeMs = Date.now() - startTime
+      console.log(`[cloudNein:gemini] Success with ${modelName} in ${totalTimeMs}ms`)
+      return parseGeminiResponse(result, totalTimeMs)
+    } catch (e) {
+      console.warn(`[cloudNein:gemini] ${modelName} failed, trying next...`, (e as Error).message?.slice(0, 120))
+      lastError = e
+    }
+  }
+
+  throw lastError ?? new Error("All Gemini models failed")
+}
+
+function parseGeminiResponse(
+  result: { response: { candidates?: Array<{ content?: { parts?: Array<{ functionCall?: { name: string; args?: unknown }; text?: string }> } }> } },
+  totalTimeMs: number,
+): { functionCalls: FunctionCall[]; totalTimeMs: number; response: string } {
 
   const functionCalls: FunctionCall[] = []
   let textResponse = ""

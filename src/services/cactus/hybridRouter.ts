@@ -215,11 +215,21 @@ function fallbackToolCall(userMessage: string, tools: Tool[]): FunctionCall | nu
     }
   }
 
-  const revMatch2 = msg.match(/(?:how much|what)\s+(?:did\s+)?(?:we\s+)?(?:make|earn|get|receive)\s+(?:from|for|with)\s+(.+?)(?:\?|$|\.|last|this)/)
-  if (revMatch2 && toolNames.has("query_revenue")) {
+  const revMatch2 = msg.match(/(?:how much|what)\s+(?:\w+\s+){0,4}(?:from|for|with)\s+(.+?)(?:\?|$|\.|last|this)/)
+  if (revMatch2 && /revenue|income|sales|earn|receive|make|get/.test(msg) && toolNames.has("query_revenue")) {
     const client = revMatch2[1].trim().replace(/[?"]/g, "")
     if (client.length > 1) {
       console.log(`[cloudNein:fallback] Extracted client "${client}" from earnings pattern`)
+      return { name: "query_revenue", arguments: { client } }
+    }
+  }
+
+  // Broader "revenue ... from X" with words in between
+  const revMatch3 = msg.match(/revenue\s+(?:\w+\s+){0,5}from\s+(.+?)(?:\?|$|\.|last|this)/)
+  if (revMatch3 && toolNames.has("query_revenue")) {
+    const client = revMatch3[1].trim().replace(/[?"]/g, "")
+    if (client.length > 1) {
+      console.log(`[cloudNein:fallback] Extracted client "${client}" from broad revenue pattern`)
       return { name: "query_revenue", arguments: { client } }
     }
   }
