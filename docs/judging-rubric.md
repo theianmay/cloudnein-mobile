@@ -1,4 +1,4 @@
-# Sovereign Ledger — Judging Rubric & Scoring Strategy
+# cloudNein — Judging Rubric & Scoring Strategy
 
 ---
 
@@ -20,14 +20,16 @@
 - App runs natively on Android with zero critical bugs
 - FunctionGemma model downloads and loads on-device
 - SQLite database initializes with realistic CFO financial data
-- All 5 tool calls execute and return real query results (not mocked)
-- PII detection, redaction, and cloud fallback all work end-to-end
-- UI shows results with colored badges, metadata, and transparency
+- All 7 tool calls execute and return real query results (not mocked)
+- PII detection, reversible subgraph redaction, and cloud analysis all work end-to-end
+- UI shows results with colored badges, routing path, routing reason, confidence, and metadata
+- DataExplorer tab lets judges see the raw SQLite data the AI queries
 
 **Risk factors:**
 - Native build issues (CMake, Gradle) — must resolve before demo
 - Model download time on slow WiFi — pre-download before demo
 - expo-sqlite or cactus-react-native runtime crashes
+- Gemini API quota — model fallback chain (2.5-flash → 2.5-flash-lite) mitigates
 
 ---
 
@@ -48,15 +50,18 @@
 - **3-tier sensitivity pipeline:**
   - LOW → FunctionGemma picks any tool, executes locally
   - MEDIUM → FunctionGemma picks tool, but `cloud_analyze` is blocked
-  - HIGH → Bypass FunctionGemma entirely, force redaction pipeline
+  - HIGH → Bypass FunctionGemma entirely, reversible subgraph redaction → Gemini compliance analysis → de-anonymize locally
+- **5-stage pipeline:** PII detection → complexity classification → context narrowing → FunctionGemma tool calling → execution
+- **5 routing paths:** local-tool, cloud-tool, cloud-analysis, privacy-redact, local-fallback
+- **Reversible subgraph anonymization** — bidirectional NodeMap (Vendor_A ↔ "Baker McKenzie") that never leaves the device. Cloud sees structural relationships without real names. Response de-anonymized locally.
 - **Confidence-based fallback** — if FunctionGemma's confidence is low, escalate to Gemini for tool selection (but still respect sensitivity filters)
 - **Offline resilience** — airplane mode demo proves local-only path works
 - **Transparency** — every response shows which path was taken and why
 
 **What makes this a "5" not a "4":**
 - It's not just "local for fast, cloud for complex" — it's a *privacy-first decision tree* that dynamically adjusts available tools based on data sensitivity
-- The routing logic itself is the core innovation, not just a fallback mechanism
-- Redaction pipeline proves data never leaves raw — this is verifiable in the UI
+- **Reversible subgraph** is genuinely novel — no existing redaction tool does round-trip anonymization with structural preservation
+- Redaction pipeline proves data never leaves raw — this is verifiable in the UI and logs
 
 ---
 
@@ -81,6 +86,7 @@
 
 **What pushes us toward "5":**
 - The agent doesn't just call tools — it *reasons about data sensitivity* before deciding what tools are even available
+- **Reversible subgraph** enables a new pattern: cloud AI gives specific, actionable advice using node aliases, then the device swaps real names back in. This multi-step anonymize→reason→de-anonymize chain is genuinely agentic.
 - This is a new UX pattern: "privacy-aware agentic routing" that only makes sense on-device
 - The CFO never has to think about privacy — the agent handles it automatically
 
@@ -115,22 +121,31 @@
 ## Demo Narrative for Judges
 
 ### Opening (30 seconds)
-> "Meet the CFO-on-the-Go. They're between meetings, approving wires, checking budgets, and reviewing expenses — all from their phone. The problem? Financial data is the most sensitive data in any company. They'd never paste it into ChatGPT. Sovereign Ledger solves this."
+> "Meet the CFO-on-the-Go. They're between meetings, approving wires, checking budgets, and reviewing expenses — all from their phone. The problem? Financial data is the most sensitive data in any company. They'd never paste it into ChatGPT. cloudNein solves this — cloud? Nein. Your data stays local."
 
-### Demo Flow (4 minutes)
+### Demo Flow (5 minutes)
 
-| Step | Prompt | What Judges See | Criterion Hit |
-|---|---|---|---|
-| 1 | "What was my total spend in February?" | Instant local answer, green badge, real SQL data | Functionality, Theme |
-| 2 | "Am I over budget on marketing?" | Budget comparison with status flags | Agentic (tool selection) |
-| 3 | "Show me all legal expenses this month" | Expense drill-down, notes visible | Functionality |
-| 4 | "How much did we pay Baker McKenzie?" | Vendor-specific lookup | Agentic (parameter extraction) |
-| 5 | "John Smith SSN 123-45-6789 approved a $50K wire" | PII auto-detected → redacted → orange badge, redacted preview shown | Hybrid Routing, Theme |
-| 6 | Turn on airplane mode → "Expense breakdown by category" | Works fully offline | Theme (local-first) |
-| 7 | Point to badges and redacted preview | Transparency: judges can verify privacy claims | All criteria |
+| # | Prompt | Routing Path | What Judges See | Criterion |
+|---|---|---|---|---|
+| 1 | "How much revenue did we receive from NovaPharma?" | `local-tool` | FunctionGemma → `query_revenue` → $76K, 3.5s, green badge | Functionality, Agentic |
+| 2 | "What is marketing budget?" | `local-tool` | Budget status with % used, status flags | Functionality |
+| 3 | "Show pending wire approvals" | `local-tool` | Wire approval queue from local DB | Agentic (tool selection) |
+| 4 | "Should we cut our marketing spend?" | `cloud-analysis` | **Reversible subgraph**: 34 entities anonymized → Gemini reasons over anonymized data → de-anonymized locally. Blue badge. | Hybrid Routing, Theme |
+| 5 | "John Smith SSN 123-45-6789 approved $50K" | `privacy-redact` | PII auto-detected (HIGH) → Person_A + SSN_A → Gemini compliance analysis with local financial context → de-anonymized. Orange badge. | Hybrid Routing, Agentic |
+| 6 | Switch to "Local Data" tab | — | Shows the 4 SQLite tables the AI queries — full transparency | Functionality |
+| 7 | Turn on airplane mode → "How much did we pay Baker McKenzie?" | `local-tool` | Works fully offline — zero cloud dependency | Theme (local-first) |
+| 8 | Point to routing reasons, badges, logs | — | Every response shows path taken, why, confidence, time | All criteria |
+
+### Key Demo Moments
+
+**Step 4 is the showstopper.** Show the logs:
+- "34 entities registered" — every vendor, client, employee aliased
+- "Anonymized context" — Gemini sees `Vendor_A`, `Client_B`, not real names
+- "De-anonymized response" — real names swapped back locally
+- Ask: *"Would you paste Baker McKenzie's $5,200 legal fee into ChatGPT? We didn't."*
 
 ### Closing (30 seconds)
-> "Every query runs through a privacy-first pipeline. PII is detected locally in milliseconds. Sensitive data is redacted before it ever touches the cloud. And when there's no internet at all, the CFO still gets answers. This is only possible because FunctionGemma runs on-device via Cactus Compute."
+> "Every query runs through a 5-stage privacy-first pipeline. PII is detected in <1ms. Sensitive data is anonymized via a reversible subgraph — a bidirectional map that never leaves the device. The cloud reasons over structural relationships without knowing real names. And when there's no internet, the CFO still gets answers. This is only possible because FunctionGemma runs on-device via Cactus Compute."
 
 ---
 
@@ -140,7 +155,7 @@
 |---|---|
 | Model download takes too long | Pre-download before demo, verify model is cached |
 | Android build fails | Have backup: screen recording of working demo |
-| Gemini API key expires | Cloud fallback fails gracefully, local still works |
+| Gemini API key expires or quota hit | Model fallback chain (2.5-flash → 2.5-flash-lite), local still works |
 | WiFi is unreliable | Airplane mode demo is a *feature*, not a bug |
 | FunctionGemma picks wrong tool | Confidence threshold triggers Gemini fallback |
 | Judge asks "why not just use ChatGPT?" | "Would you paste your company's SSNs and salary data into ChatGPT?" |

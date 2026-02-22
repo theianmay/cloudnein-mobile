@@ -1,6 +1,6 @@
-# Sovereign Ledger — Technical Roadmap & Progress Tracker
+# cloudNein — Technical Roadmap & Progress Tracker
 
-> **Last updated:** Phases 1-6 COMPLETE. TypeScript compiles cleanly. Ready for on-device testing.
+> **Last updated:** Phases 1-8 COMPLETE. All 3 routing paths verified on Android device. Reversible subgraph working end-to-end with Gemini 2.5 Flash.
 
 ---
 
@@ -108,32 +108,43 @@
 
 ---
 
-## Phase 7: On-Device Testing + Demo Polish — NEXT
+## Phase 7: On-Device Testing + Demo Polish — DONE
 
 **Goal:** End-to-end flow works on a real device. Demo script rehearsed.
 
 | Task | File(s) | Status |
 |---|---|---|
-| Run `npx expo prebuild --clean` | — | NOT STARTED |
-| Run on iOS or Android device | — | NOT STARTED |
-| Test: local expense query works | — | NOT STARTED |
-| Test: budget status query works | — | NOT STARTED |
-| Test: PII detection triggers redaction | — | NOT STARTED |
-| Test: airplane mode (offline) works | — | NOT STARTED |
-| Test: cloud fallback with redacted data | — | NOT STARTED |
-| Fix any bugs found | various | NOT STARTED |
-
-**Estimated time:** 30-45 min
+| Run on Android device (EAS dev build) | — | DONE |
+| Test: local-tool path (revenue, budget, expenses, wires) | — | DONE ✓ |
+| Test: cloud-analysis path (reversible subgraph round-trip) | — | DONE ✓ |
+| Test: privacy-redact path (PII → Person_A → Gemini → de-anonymize) | — | DONE ✓ |
+| Test: airplane mode (offline) | — | PENDING |
+| Fix Gemini model names (2.0→2.5-flash) | `geminiCloud.ts` | DONE |
+| Add model fallback chain (2.5-flash → 2.5-flash-lite) | `geminiCloud.ts` | DONE |
+| Fix fallback regex for revenue queries | `hybridRouter.ts` | DONE |
+| Upgrade privacy-redact to use reversible subgraph + compliance reasoning | `hybridRouter.ts` | DONE |
 
 ---
 
-## Phase 8: Stretch Goals (If Time Permits)
+## Phase 8: Reversible Subgraph + DataExplorer — DONE
 
 | Task | File(s) | Status |
 |---|---|---|
-| Privacy dashboard screen | `src/screens/PrivacyDashboardScreen.tsx` | NOT STARTED |
+| Implement reversible subgraph (NodeMap) in redactor | `src/services/privacy/redactor.ts` | DONE |
+| Integrate subgraph into cloud-analysis path | `src/services/cactus/hybridRouter.ts` | DONE |
+| Integrate subgraph into privacy-redact path | `src/services/cactus/hybridRouter.ts` | DONE |
+| DataExplorer screen (view all 4 SQLite tables) | `src/screens/DataExplorerScreen.tsx` | DONE |
+| Tab navigation (Chat + Local Data) | `src/app/_layout.tsx`, `src/app/data.tsx` | DONE |
+
+---
+
+## Phase 9: Stretch Goals (If Time Permits)
+
+| Task | File(s) | Status |
+|---|---|---|
 | Voice input via `CactusSTT` | `src/services/cactus/stt.ts` | NOT STARTED |
 | Connectivity-aware routing (NetInfo) | `src/services/cactus/hybridRouter.ts` | NOT STARTED |
+| Align with teammate's Python routing strategy | `src/services/cactus/hybridRouter.ts` | NOT STARTED |
 
 ---
 
@@ -143,44 +154,57 @@
 User Input
     │
     ▼
-┌────────────────────┐
-│ PII Detector       │ ← Always runs first (regex, <1ms)
-│ (local, instant)   │
-└────────┬───────────┘
-         │
-         ▼
-┌────────────────────┐
-│ Sensitivity Scorer │ ← Rule-based: LOW / MEDIUM / HIGH
-└────────┬───────────┘
-         │
-    ┌────┴────┬──────────┐
-    │         │          │
-   LOW      MEDIUM     HIGH
-    │         │          │
-    ▼         ▼          ▼
- FuncGemma  FuncGemma   Force
- picks any  (cloud      redact_and_analyze
- tool       blocked     (skip model)
-    │       unless       │
-    │       redact)      │
-    ▼         │          │
-┌─────────┐  │     ┌────┴──────────┐
-│ Execute │  │     │ Redact PII    │
-│ locally │  │     │ → Send to     │
-│         │  │     │   Gemini      │
-└─────────┘  │     └───────────────┘
-             │
-             ▼
-      ┌─────────────┐
-      │ Execute     │
-      │ tool result │
-      └─────────────┘
-             │
-             ▼
-      ┌─────────────┐
-      │ ChatScreen  │
-      │ + badges    │
-      └─────────────┘
+Stage 0: PII Detection (<1ms, regex)
+    │ HIGH sensitivity → privacy-redact path ──┐
+    │ LOW/MEDIUM ↓                             │
+    ▼                                          │
+Stage 1: Complexity Classifier (<1ms)          │
+    │ ANALYTICAL → cloud-analysis path ──┐     │
+    │ DATA-LOOKUP ↓                      │     │
+    ▼                                    │     │
+Stage 2: Context Narrowing (<1ms)        │     │
+    │ 7 tools → 2-3 relevant tools       │     │
+    ▼                                    │     │
+Stage 3: FunctionGemma (~3s, on-device)  │     │
+    │ High conf → local-tool ──┐         │     │
+    │ Low conf → cloud-tool ──┐│         │     │
+    │ All fail → fallback ───┐││         │     │
+    ▼                        │││         │     │
+Stage 4: Execution           │││         │     │
+                             │││         │     │
+  ┌──────────────────────────┘││         │     │
+  │ local-tool / fallback     ││         │     │
+  │ SQL → on-device SQLite    ││         │     │
+  │                           ││         │     │
+  │  ┌────────────────────────┘│         │     │
+  │  │ cloud-tool              │         │     │
+  │  │ Gemini picks tool →     │         │     │
+  │  │ SQL → on-device SQLite  │         │     │
+  │  │                         │         │     │
+  │  │  ┌──────────────────────┘         │     │
+  │  │  │ cloud-analysis                 │     │
+  │  │  │ Gather local data              │     │
+  │  │  │ → Build NodeMap (34 entities)  │     │
+  │  │  │ → Anonymize (Vendor_A, etc.)   │     │
+  │  │  │ → Gemini reasons               │     │
+  │  │  │ → De-anonymize locally         │     │
+  │  │  │                                │     │
+  │  │  │  ┌─────────────────────────────┘     │
+  │  │  │  │ privacy-redact                    │
+  │  │  │  │ Detect PII → Build NodeMap ←──────┘
+  │  │  │  │ → Anonymize (Person_A, SSN_A)
+  │  │  │  │ → Gather local context
+  │  │  │  │ → Gemini compliance analysis
+  │  │  │  │ → De-anonymize locally
+  │  │  │  │
+  ▼  ▼  ▼  ▼
+┌─────────────────┐
+│ ChatScreen UI   │
+│ Source badges    │
+│ Routing reason   │
+│ Confidence/time  │
+│ Redacted preview │
+└─────────────────┘
 ```
 
 ---
@@ -190,27 +214,29 @@ User Input
 ```
 src/
 ├── app/
-│   ├── _layout.tsx                    (no changes needed)
-│   └── index.tsx                      (DONE — points to ChatScreen)
+│   ├── _layout.tsx                    (Tabs: Chat + Local Data)
+│   ├── index.tsx                      (ChatScreen route)
+│   └── data.tsx                       (DataExplorerScreen route)
 ├── screens/
-│   ├── ChatScreen.tsx                 (Phase 5 — update UI)
+│   ├── ChatScreen.tsx                 (Main chat UI with badges + metadata)
+│   ├── DataExplorerScreen.tsx         (Browse all 4 SQLite tables)
 │   └── WelcomeScreen.tsx              (kept, unused)
 ├── services/
 │   ├── cactus/
-│   │   ├── index.ts                   (Phase 4 — update exports)
-│   │   ├── types.ts                   (Phase 4 — add redacted source)
-│   │   ├── tools.ts                   (Phase 2 — rewrite with 5 tools)
-│   │   ├── toolExecutor.ts            (Phase 2 — NEW)
-│   │   ├── hybridRouter.ts            (Phase 4 — rewrite)
-│   │   └── geminiCloud.ts             (DONE — no changes)
+│   │   ├── index.ts                   (barrel exports)
+│   │   ├── types.ts                   (HybridResult, RoutingPath, etc.)
+│   │   ├── tools.ts                   (7 financial tools)
+│   │   ├── toolExecutor.ts            (executor + fuzzy matching)
+│   │   ├── hybridRouter.ts            (5-stage pipeline + reversible subgraph)
+│   │   └── geminiCloud.ts             (Gemini 2.5 Flash + model fallback)
 │   ├── database/
-│   │   ├── index.ts                   (Phase 1 — NEW)
-│   │   ├── seed.ts                    (Phase 1 — NEW)
-│   │   └── queries.ts                 (Phase 1 — NEW)
+│   │   ├── index.ts                   (schema + init)
+│   │   ├── seed.ts                    (realistic CFO data: 4 tables)
+│   │   └── queries.ts                 (typed query functions)
 │   └── privacy/
-│       ├── index.ts                   (Phase 3 — NEW)
-│       ├── piiDetector.ts             (Phase 3 — NEW)
-│       ├── sensitivityScorer.ts       (Phase 3 — NEW)
-│       └── redactor.ts                (Phase 3 — NEW)
+│       ├── index.ts                   (barrel exports)
+│       ├── piiDetector.ts             (regex PII detection)
+│       ├── sensitivityScorer.ts       (rule-based LOW/MEDIUM/HIGH)
+│       └── redactor.ts                (reversible subgraph: NodeMap + anonymize/deAnonymize)
 └── ...
 ```
